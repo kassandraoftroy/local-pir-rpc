@@ -1,7 +1,7 @@
 mod lookup;
 mod server;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use clap::Parser;
 use kohaku_pir_provider::PirRouter;
@@ -24,6 +24,10 @@ struct Args {
     /// Fallback Ethereum JSON-RPC URL (mainnet).
     #[arg(long, env = "ETH_RPC_URL")]
     rpc_url: String,
+
+    /// PIR clients to keep, so this many lookups can run at the same time.
+    #[arg(long, default_value_t = 4)]
+    pir_clients: usize,
 }
 
 #[tokio::main]
@@ -44,21 +48,24 @@ async fn main() {
         std::process::exit(1);
     }
 
-    info!(pir = %args.pir_url, "connecting PirClient");
-    let client = match PirClient::connect(&args.pir_url) {
-        Ok(c) => c,
-        Err(e) => {
-            error!(error = %e, "PirClient::connect failed");
-            std::process::exit(1);
+    info!(pir = %args.pir_url, clients = args.pir_clients, "connecting PirClient");
+    let mut clients = Vec::new();
+    for _ in 0..args.pir_clients.max(1) {
+        match PirClient::connect(&args.pir_url) {
+            Ok(c) => clients.push(c),
+            Err(e) => {
+                error!(error = %e, "PirClient::connect failed");
+                std::process::exit(1);
+            }
         }
-    };
+    }
     info!(
-        key_size = client.manifest.cuckoo.key_size,
-        value_size = client.manifest.cuckoo.value_size,
+        key_size = clients[0].manifest.cuckoo.key_size,
+        value_size = clients[0].manifest.cuckoo.value_size,
         "PIR manifest loaded"
     );
 
-    let lookup = Arc::new(PirLookup(Mutex::new(client)));
+    let lookup = Arc::new(PirLookup::new(clients));
     let router = match PirRouter::with_rpc(lookup, &args.rpc_url, Vec::new()) {
         Ok(r) => Arc::new(r),
         Err(e) => {
