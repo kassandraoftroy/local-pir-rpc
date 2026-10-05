@@ -1,19 +1,23 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Instant;
 
+use alloy::rpc::json_rpc::{
+    ErrorPayload, Id, Request, RequestPacket, Response, ResponsePacket, ResponsePayload,
+};
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use kohaku_pir_provider::PirRouter;
+use kohaku_privacy_rpc::PrivacyTransport;
 use serde_json::{Value, json};
+use tower::Service;
 use tracing::info;
 
-pub type AppState = Arc<PirRouter>;
+pub type AppState = Arc<PrivacyTransport>;
 
-/// Handle a JSON-RPC POST body (single object or batch array).
 pub async fn handle_rpc(
-    State(router): State<AppState>,
+    State(transport): State<AppState>,
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     let Json(body) = match body {
@@ -31,66 +35,125 @@ pub async fn handle_rpc(
         }
     };
 
-    if let Some(arr) = body.as_array() {
-        let mut out = Vec::with_capacity(arr.len());
-        for item in arr {
-            out.push(dispatch_one(&router, item).await);
-        }
-        return (StatusCode::OK, Json(Value::Array(out))).into_response();
-    }
-
-    (StatusCode::OK, Json(dispatch_one(&router, &body).await)).into_response()
-}
-
-async fn dispatch_one(router: &PirRouter, req: &Value) -> Value {
-    let id = req.get("id").cloned().unwrap_or(Value::Null);
-    let method = match req.get("method").and_then(|m| m.as_str()) {
-        Some(m) => m,
-        None => {
-            return json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32600, "message": "invalid request: missing method" }
-            });
+    let packet = match json_to_packet(&body) {
+        Ok(p) => p,
+        Err(msg) => {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": { "code": -32600, "message": msg }
+                })),
+            )
+                .into_response();
         }
     };
-    let params = req.get("params").cloned().unwrap_or(Value::Array(vec![]));
 
-    let route = router.routes().classify(method, &params);
+    let planned: Vec<_> = packet
+        .requests()
+        .iter()
+        .map(|req| {
+            let method = req.method().to_string();
+            let params = req
+                .params()
+                .map(|raw| serde_json::from_str(raw.get()).unwrap_or(Value::Null))
+                .unwrap_or(Value::Array(vec![]));
+            let route = transport.router().routes().classify(&method, &params);
+            (method, route)
+        })
+        .collect();
+
     let start = Instant::now();
-    let result = router.request(method, params).await;
-    let elapsed_ms = start.elapsed().as_millis();
-
-    match result {
-        Ok(value) => {
-            info!(
-                method,
-                ?route,
-                elapsed_ms,
-                "ok"
-            );
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": value
-            })
-        }
+    let mut t = (*transport).clone();
+    let resp = match Service::call(&mut t, packet).await {
+        Ok(r) => r,
         Err(e) => {
-            info!(
-                method,
-                ?route,
-                elapsed_ms,
-                error = %e,
-                "err"
-            );
+            info!(error = %e, elapsed_ms = start.elapsed().as_millis(), "transport error");
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": { "code": -32603, "message": e.to_string() }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let elapsed_ms = start.elapsed().as_millis();
+    for (method, route) in planned {
+        info!(method, ?route, elapsed_ms, "handled");
+    }
+
+    (StatusCode::OK, Json(packet_to_json(resp))).into_response()
+}
+
+fn json_to_packet(body: &Value) -> Result<RequestPacket, String> {
+    if let Some(arr) = body.as_array() {
+        let mut reqs = Vec::with_capacity(arr.len());
+        for item in arr {
+            reqs.push(json_to_serialized(item)?);
+        }
+        return Ok(RequestPacket::Batch(reqs));
+    }
+    Ok(RequestPacket::Single(json_to_serialized(body)?))
+}
+
+fn json_to_serialized(obj: &Value) -> Result<alloy::rpc::json_rpc::SerializedRequest, String> {
+    let method = obj
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing method".to_string())?;
+    let id = parse_id(obj.get("id").unwrap_or(&Value::Null))?;
+    let params = obj.get("params").cloned().unwrap_or(Value::Array(vec![]));
+    let params_raw = serde_json::value::to_raw_value(&params).map_err(|e| e.to_string())?;
+    Request::new(Cow::Owned(method.to_string()), id, params_raw)
+        .serialize()
+        .map_err(|e| e.to_string())
+}
+
+fn parse_id(v: &Value) -> Result<Id, String> {
+    match v {
+        Value::Null => Ok(Id::None),
+        Value::Number(n) => n
+            .as_u64()
+            .map(Id::Number)
+            .ok_or_else(|| "id number out of range".to_string()),
+        Value::String(s) => Ok(Id::String(s.clone().into())),
+        _ => Err("invalid json-rpc id".into()),
+    }
+}
+
+fn packet_to_json(packet: ResponsePacket) -> Value {
+    match packet {
+        ResponsePacket::Single(r) => response_to_json(r),
+        ResponsePacket::Batch(rs) => Value::Array(rs.into_iter().map(response_to_json).collect()),
+    }
+}
+
+fn response_to_json(r: Response) -> Value {
+    let id = id_to_json(&r.id);
+    match r.payload {
+        ResponsePayload::Success(raw) => {
+            let result: Value = serde_json::from_str(raw.get()).unwrap_or(Value::Null);
+            json!({ "jsonrpc": "2.0", "id": id, "result": result })
+        }
+        ResponsePayload::Failure(ErrorPayload { code, message, .. }) => {
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "error": {
-                    "code": e.rpc_code(),
-                    "message": e.to_string()
-                }
+                "error": { "code": code, "message": message.as_ref() }
             })
         }
+    }
+}
+
+fn id_to_json(id: &Id) -> Value {
+    match id {
+        Id::None => Value::Null,
+        Id::Number(n) => json!(n),
+        Id::String(s) => Value::String(s.to_string()),
     }
 }

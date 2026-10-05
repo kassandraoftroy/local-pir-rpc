@@ -1,27 +1,29 @@
-mod lookup;
 mod server;
+mod tor_pir_client;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use clap::Parser;
-use kohaku_pir_provider::PirRouter;
-use lookup::PirLookup;
-use pir_client::PirClient;
+use kohaku_privacy_rpc::PrivacyBuilder;
+use tor_pir_client::TorPirClientLookup;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "local-pir-rpc", about = "localhost JSON-RPC facade over kohaku-pir-provider")]
+#[command(
+    name = "local-pir-rpc",
+    about = "localhost JSON-RPC facade over kohaku-privacy-rpc (Tor + PIR)"
+)]
 struct Args {
     /// Bind address for the Ethereum JSON-RPC HTTP server.
     #[arg(long, default_value = "127.0.0.1:8545")]
     listen: String,
 
-    /// inspire-gpu-serving PIR HTTP base URL.
+    /// inspire-gpu-serving PIR HTTP base URL (reached over Tor).
     #[arg(long, env = "PIR_URL")]
     pir_url: String,
 
-    /// Fallback Ethereum JSON-RPC URL (mainnet).
+    /// Fallback Ethereum JSON-RPC URL (reached over Tor).
     #[arg(long, env = "ETH_RPC_URL")]
     rpc_url: String,
 }
@@ -44,32 +46,43 @@ async fn main() {
         std::process::exit(1);
     }
 
-    info!(pir = %args.pir_url, "connecting PirClient");
-    let client = match PirClient::connect(&args.pir_url) {
-        Ok(c) => c,
+    info!("bootstrapping Tor (Arti)…");
+    let tor = match kohaku_tor_rpc::TorRpc::connect().await {
+        Ok(t) => t,
         Err(e) => {
-            error!(error = %e, "PirClient::connect failed");
+            error!(error = %e, "Tor bootstrap failed");
             std::process::exit(1);
         }
     };
-    info!(
-        key_size = client.manifest.cuckoo.key_size,
-        value_size = client.manifest.cuckoo.value_size,
-        "PIR manifest loaded"
-    );
+    info!("Tor ready");
 
-    let lookup = Arc::new(PirLookup(Mutex::new(client)));
-    let router = match PirRouter::with_rpc(lookup, &args.rpc_url, Vec::new()) {
-        Ok(r) => Arc::new(r),
+    info!(pir = %args.pir_url, "connecting PIR over Tor");
+    let lookup = match TorPirClientLookup::connect(tor.clone(), &args.pir_url).await {
+        Ok(l) => l,
         Err(e) => {
-            error!(error = %e, "PirRouter::with_rpc failed");
+            error!(error = %e, "PIR manifest over Tor failed");
+            std::process::exit(1);
+        }
+    };
+
+    let transport = match PrivacyBuilder::new(&args.rpc_url) {
+        Ok(builder) => builder
+            .tor(tor)
+            .pir_lookup(lookup, Vec::new())
+            .build_transport(),
+        Err(e) => Err(e),
+    };
+    let transport = match transport {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            error!(error = %e, "PrivacyBuilder failed");
             std::process::exit(1);
         }
     };
 
     let app = axum::Router::new()
         .route("/", axum::routing::post(server::handle_rpc))
-        .with_state(router);
+        .with_state(transport);
 
     let listener = match tokio::net::TcpListener::bind(&args.listen).await {
         Ok(l) => l,
@@ -80,8 +93,9 @@ async fn main() {
     };
     info!(
         listen = %args.listen,
+        pir = %args.pir_url,
         fallback = %args.rpc_url,
-        "local-pir-rpc listening"
+        "local-pir-rpc listening (all egress via Tor)"
     );
 
     if let Err(e) = axum::serve(listener, app)

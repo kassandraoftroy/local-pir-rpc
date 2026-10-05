@@ -2,7 +2,7 @@
 name = "local-pir-rpc"
 version = "0.1.0"
 edition = "2021"
-description = "localhost:8545 JSON-RPC facade over kohaku-pir-provider for kohaku-cli demos"
+description = "localhost:8545 JSON-RPC facade over kohaku-privacy-rpc (Tor + PIR) for kohaku-cli demos"
 publish = false
 
 [[bin]]
@@ -10,12 +10,20 @@ name = "local-pir-rpc"
 path = "src/main.rs"
 
 [dependencies]
+alloy = { version = "2.4.1", default-features = false, features = ["json-rpc"] }
+async-trait = "0.1"
 axum = "0.8"
 clap = { version = "4.5", features = ["derive", "env"] }
-kohaku-pir-provider = { path = "../kohaku-rs/crates/pir-provider" }
-pir-client = { path = "../inspire-gpu-serving/crates/client" }
+hex = "0.4"
+kohaku-privacy-rpc = { path = "../kohaku-rs/crates/privacy-rpc" }
+kohaku-tor-rpc = { path = "../kohaku-rs/crates/tor-rpc" }
+kohaku-pir-rpc = { path = "../kohaku-rs/crates/pir-rpc" }
+pir-backend-ffi = { path = "../inspire-gpu-serving/crates/backend-ffi" }
+pir-keyword = { path = "../inspire-gpu-serving/crates/keyword" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
