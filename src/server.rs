@@ -5,19 +5,52 @@ use std::time::Instant;
 use alloy::rpc::json_rpc::{
     ErrorPayload, Id, Request, RequestPacket, Response, ResponsePacket, ResponsePayload,
 };
+use alloy::transports::TransportError;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use kohaku_pir_rpc::{PirTransport, RouteTable};
 use kohaku_privacy_rpc::PrivacyTransport;
 use serde_json::{Value, json};
 use tower::Service;
 use tracing::info;
 
-pub type AppState = Arc<PrivacyTransport>;
+/// JSON-RPC backend: Tor+PIR orchestrator or clearnet pir-rpc.
+#[derive(Clone)]
+pub enum Backend {
+    /// All egress via Tor ([`PrivacyTransport`]).
+    Tor(PrivacyTransport),
+    /// Clearnet PIR + clearnet fallback RPC ([`PirTransport`]).
+    Clearnet(PirTransport),
+}
+
+impl Backend {
+    fn routes(&self) -> &RouteTable {
+        match self {
+            Self::Tor(t) => t.router().routes(),
+            Self::Clearnet(t) => t.router().routes(),
+        }
+    }
+
+    async fn call(&self, packet: RequestPacket) -> Result<ResponsePacket, TransportError> {
+        match self {
+            Self::Tor(t) => {
+                let mut t = t.clone();
+                Service::call(&mut t, packet).await
+            }
+            Self::Clearnet(t) => {
+                let mut t = t.clone();
+                Service::call(&mut t, packet).await
+            }
+        }
+    }
+}
+
+pub type AppState = Arc<Backend>;
 
 pub async fn handle_rpc(
-    State(transport): State<AppState>,
+    State(backend): State<AppState>,
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     let Json(body) = match body {
@@ -59,14 +92,13 @@ pub async fn handle_rpc(
                 .params()
                 .map(|raw| serde_json::from_str(raw.get()).unwrap_or(Value::Null))
                 .unwrap_or(Value::Array(vec![]));
-            let route = transport.router().routes().classify(&method, &params);
+            let route = backend.routes().classify(&method, &params);
             (method, route)
         })
         .collect();
 
     let start = Instant::now();
-    let mut t = (*transport).clone();
-    let resp = match Service::call(&mut t, packet).await {
+    let resp = match backend.call(packet).await {
         Ok(r) => r,
         Err(e) => {
             info!(error = %e, elapsed_ms = start.elapsed().as_millis(), "transport error");

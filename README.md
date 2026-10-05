@@ -1,21 +1,19 @@
 # local-pir-rpc
 
-Thin `localhost:8545` Ethereum JSON-RPC facade over
-[`kohaku-privacy-rpc`](https://github.com/ethereum/kohaku-rs) (`Tor` + PIR). All
-remote traffic — PIR (`/manifest`, encrypted `/lookup`) and fallback Ethereum
-JSON-RPC — egresses through Arti on **shared** circuits for PIR and
-shared/isolated circuits for fallback RPC per the privacy orchestrator.
+Thin `localhost:8545` Ethereum JSON-RPC facade for
+[kohaku-cli](https://github.com/kassandraoftroy/kohaku-cli) demos.
 
-Hybrid routing (PIR allowlist vs fallback RPC) lives in
-[`kohaku-pir-rpc`](https://github.com/ethereum/kohaku-rs/tree/experiments/pir-v1/crates/pir-rpc).
-This binary wires inspire-gpu-serving crypto over Tor HTTP and serves HTTP for
-process-isolated demos with
-[kohaku-cli](https://github.com/kassandraoftroy/kohaku-cli).
+**Default:** Tor everywhere via
+[`kohaku-privacy-rpc`](https://github.com/ethereum/kohaku-rs) — PIR and fallback
+Ethereum RPC both egress through Arti.
 
-## Two-terminal demo
+**`--without-tor`:** clearnet only via
+[`kohaku-pir-rpc`](https://github.com/ethereum/kohaku-rs/tree/experiments/pir-v1/crates/pir-rpc)
+— no Tor on PIR or fallback (good for local/dev PIR servers).
 
-**Terminal 1** — start the proxy (needs mainnet RPC + PIR URLs reachable via Tor
-exits):
+## Tor mode (default)
+
+Needs PIR + RPC URLs reachable via Tor exits:
 
 ```bash
 export ETH_RPC_URL="https://your-mainnet-rpc.example"
@@ -26,16 +24,26 @@ cargo run --release -- \
   --rpc-url "$ETH_RPC_URL"
 ```
 
-First run bootstraps Tor; PIR manifest fetch and lookups use Tor HTTP.
+First run bootstraps Tor; then fetches the PIR manifest and serves lookups over Tor.
 
-**Terminal 2** — point kohaku-cli at the proxy:
+## Clearnet mode
+
+```bash
+cargo run --release -- \
+  --without-tor \
+  --listen 127.0.0.1:8545 \
+  --pir-url "$PIR_URL" \
+  --rpc-url "$ETH_RPC_URL"
+```
+
+## Client
 
 ```bash
 kohaku <command> --rpc-url http://localhost:8545
 ```
 
-Watch Terminal 1: `eth_getBalance` / `eth_getTransactionCount` (latest) log as
-PIR routes; `eth_chainId`, `eth_getLogs`, etc. log as fallback (still over Tor).
+Watch logs: `eth_getBalance` / `eth_getTransactionCount` (latest) as PIR;
+`eth_chainId`, `eth_getLogs`, etc. as fallback.
 
 ## Flags
 
@@ -44,12 +52,19 @@ PIR routes; `eth_chainId`, `eth_getLogs`, etc. log as fallback (still over Tor).
 | `--listen` | | `127.0.0.1:8545` |
 | `--pir-url` | `PIR_URL` | *(required)* |
 | `--rpc-url` | `ETH_RPC_URL` | *(required)* |
+| `--pir-pool-size` | `PIR_POOL_SIZE` | `16` |
+| `--without-tor` | | off (Tor on) |
+
+### Concurrent PIR lookups
+
+A single `PirClient` behind a mutex serializes lookups (see
+[issue #1](https://github.com/kassandraoftroy/local-pir-rpc/issues/1)). Both
+modes keep a pool of clients (default 16) so concurrent lookups stay near one
+lookup of latency.
 
 ## Dependencies
 
 Path crates (sibling checkouts):
 
-- `../kohaku-rs/crates/privacy-rpc`
-- `../kohaku-rs/crates/tor-rpc`
-- `../kohaku-rs/crates/pir-rpc`
-- `../inspire-gpu-serving/crates/{backend-ffi,keyword}` (CPU-only PIR crypto)
+- `../kohaku-rs/crates/{privacy-rpc,tor-rpc,pir-rpc}`
+- `../inspire-gpu-serving/crates/{client,backend-ffi,keyword}`
