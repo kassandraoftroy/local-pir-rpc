@@ -6,20 +6,21 @@
 //! [kassandraoftroy/local-pir-rpc#1](https://github.com/kassandraoftroy/local-pir-rpc/issues/1)).
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use kohaku_tor_rpc::TorRpc;
 use pir_backend_ffi::{pack_query, ClientQuery, Params};
 use pir_keyword::cuckoo::CuckooHash;
 use pir_keyword::manifest::{Manifest, SidecarBroadcast};
 use pir_keyword::slots::unpack_bytes;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Semaphore, SemaphorePermit};
 use url::Url;
 
 const MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 
-/// Default pool size: matches inspire-gpu-serving parallel client capacity used in benches.
-pub const DEFAULT_POOL_SIZE: usize = 16;
+/// Default Tor PIR concurrency. Higher values open many Tor streams at once and
+/// tend to thrash guards; clearnet mode can raise this via `--pir-pool-size`.
+pub const DEFAULT_POOL_SIZE: usize = 2;
 
 /// Tor-backed PIR HTTP client (manifest + encrypted `/lookup` POSTs).
 #[derive(Clone)]
@@ -182,9 +183,19 @@ enum LookupOutcome {
 /// One mutex-wrapped client serializes every PIR call (~N× lookup latency under
 /// load). A pool of size S lets up to S lookups progress at once; extras wait
 /// for a free client.
+///
+/// Idle clients use a sync mutex so [`PooledClient`]'s `Drop` can always return
+/// a client even when a lookup future is cancelled (e.g. `try_join_all` abort).
 struct ClientPool {
     idle: Mutex<VecDeque<TorPirClient>>,
     permits: Semaphore,
+}
+
+/// RAII checkout: returns the client to the pool on drop (success, error, or cancel).
+struct PooledClient<'a> {
+    pool: &'a ClientPool,
+    client: Option<TorPirClient>,
+    _permit: SemaphorePermit<'a>,
 }
 
 impl ClientPool {
@@ -196,35 +207,82 @@ impl ClientPool {
         }
     }
 
-    async fn checkout(&self) -> (tokio::sync::SemaphorePermit<'_>, TorPirClient) {
+    async fn checkout(&self) -> PooledClient<'_> {
         let permit = self.permits.acquire().await.expect("semaphore closed");
         let client = self
             .idle
             .lock()
-            .await
+            .unwrap_or_else(|e| e.into_inner())
             .pop_front()
             .expect("permit implies an idle client");
-        (permit, client)
+        PooledClient {
+            pool: self,
+            client: Some(client),
+            _permit: permit,
+        }
     }
+}
 
-    async fn checkin(&self, client: TorPirClient) {
-        self.idle.lock().await.push_back(client);
+impl PooledClient<'_> {
+    fn client_mut(&mut self) -> &mut TorPirClient {
+        self.client
+            .as_mut()
+            .expect("pooled client taken before drop")
     }
+}
+
+impl Drop for PooledClient<'_> {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            self.pool
+                .idle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(client);
+        }
+        // `_permit` drops after this method, releasing the slot only once the
+        // client is idle again.
+    }
+}
+
+/// How keys are interpreted before hitting the PIR server.
+#[derive(Clone, Copy, Debug)]
+pub enum KeyMode {
+    /// 20-byte EOAs: apply the server's account `key_derivation` (e.g. keccak).
+    Account,
+    /// Pre-derived storage keys: pass through to `lookup` unchanged.
+    Storage,
 }
 
 /// [`kohaku_privacy_rpc::AsyncLookupBackend`] over a pool of inspire PIR clients + Tor HTTP.
 pub struct TorPirClientLookup {
     pool: ClientPool,
     pool_size: usize,
+    key_mode: KeyMode,
 }
 
 impl TorPirClientLookup {
-    /// Bootstrap one manifest fetch, then clone into a pool of `pool_size` clients.
+    /// Bootstrap one manifest fetch, then clone into a pool of `pool_size` account-mode clients.
     ///
     /// # Errors
     ///
     /// Returns when Tor/manifest setup fails, or `pool_size` is zero.
+    #[allow(dead_code)]
     pub async fn connect(tor: TorRpc, base: &str, pool_size: usize) -> Result<Arc<Self>, String> {
+        Self::connect_with_mode(tor, base, pool_size, KeyMode::Account).await
+    }
+
+    /// Like [`connect`](Self::connect) with an explicit [`KeyMode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns when Tor/manifest setup fails, or `pool_size` is zero.
+    pub async fn connect_with_mode(
+        tor: TorRpc,
+        base: &str,
+        pool_size: usize,
+        key_mode: KeyMode,
+    ) -> Result<Arc<Self>, String> {
         if pool_size == 0 {
             return Err("pir pool size must be >= 1".into());
         }
@@ -233,6 +291,7 @@ impl TorPirClientLookup {
         Ok(Arc::new(Self {
             pool: ClientPool::new(clients),
             pool_size,
+            key_mode,
         }))
     }
 
@@ -243,15 +302,17 @@ impl TorPirClientLookup {
     }
 
     async fn lookup_one(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
-        let (permit, mut client) = self.pool.checkout().await;
-        let result = if key.len() == 20 {
-            client.lookup_address(key).await
-        } else {
-            client.lookup(key).await
-        };
-        self.pool.checkin(client).await;
-        drop(permit);
-        result
+        let mut pooled = self.pool.checkout().await;
+        match self.key_mode {
+            KeyMode::Account => {
+                if key.len() == 20 {
+                    pooled.client_mut().lookup_address(key).await
+                } else {
+                    pooled.client_mut().lookup(key).await
+                }
+            }
+            KeyMode::Storage => pooled.client_mut().lookup(key).await,
+        }
     }
 }
 
@@ -264,16 +325,18 @@ impl kohaku_privacy_rpc::AsyncLookupBackend for TorPirClientLookup {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        // Run lookups concurrently; pool size caps in-flight Tor/PIR work.
+        // Concurrent lookups; pool size caps in-flight Tor/PIR work.
+        // Prefer `join_all` over `try_join_all` so one failure does not cancel
+        // siblings mid-checkout (RAII also returns clients on cancel).
         let futs = keys.iter().map(|key| {
             let key = key.clone();
-            async move {
-                self.lookup_one(&key)
-                    .await
-                    .map_err(kohaku_pir_rpc::PirProviderError::Client)
-            }
+            async move { self.lookup_one(&key).await }
         });
-        futures::future::try_join_all(futs).await
+        let results = futures::future::join_all(futs).await;
+        results
+            .into_iter()
+            .map(|r| r.map_err(kohaku_pir_rpc::PirProviderError::Client))
+            .collect()
     }
 }
 
@@ -298,12 +361,12 @@ mod tests {
                 let permits = &permits;
                 async move {
                     let permit = permits.acquire().await.unwrap();
-                    let idx = idle.lock().await.pop_front().unwrap();
+                    let idx = idle.lock().unwrap().pop_front().unwrap();
                     let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(n, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(30)).await;
                     in_flight.fetch_sub(1, Ordering::SeqCst);
-                    idle.lock().await.push_back(idx);
+                    idle.lock().unwrap().push_back(idx);
                     drop(permit);
                 }
             })
@@ -313,6 +376,48 @@ mod tests {
             peak.load(Ordering::SeqCst) >= 4,
             "expected at least 4 concurrent checkouts, got {}",
             peak.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Regression: dropping a checkout must return the item before releasing the
+    /// permit (previously: permit Drop leaked the client → panic on next acquire).
+    #[tokio::test]
+    async fn drop_returns_item_before_permit() {
+        struct Guard<'a> {
+            idle: &'a Mutex<VecDeque<u8>>,
+            item: Option<u8>,
+            _permit: SemaphorePermit<'a>,
+        }
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                if let Some(item) = self.item.take() {
+                    self.idle.lock().unwrap().push_back(item);
+                }
+            }
+        }
+
+        let idle = Mutex::new(VecDeque::from([1_u8, 2]));
+        let permits = Semaphore::new(2);
+
+        {
+            let permit = permits.acquire().await.unwrap();
+            let item = idle.lock().unwrap().pop_front().unwrap();
+            let guard = Guard {
+                idle: &idle,
+                item: Some(item),
+                _permit: permit,
+            };
+            // Abort path: drop without explicit checkin.
+            drop(guard);
+        }
+
+        assert_eq!(idle.lock().unwrap().len(), 2);
+        // Both permits usable again.
+        let _a = permits.acquire().await.unwrap();
+        let _b = permits.acquire().await.unwrap();
+        assert!(
+            idle.lock().unwrap().pop_front().is_some(),
+            "idle queue still populated after Drop checkin"
         );
     }
 }
