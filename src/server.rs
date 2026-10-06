@@ -101,7 +101,7 @@ pub async fn handle_rpc(
     let resp = match backend.call(packet).await {
         Ok(r) => r,
         Err(e) => {
-            info!(error = %e, elapsed_ms = start.elapsed().as_millis(), "transport error");
+            info!(error = %e, elapsed_ms = format!("{:.3}", start.elapsed().as_secs_f64() * 1000.0), "transport error");
             return (
                 StatusCode::OK,
                 Json(json!({
@@ -114,9 +114,27 @@ pub async fn handle_rpc(
         }
     };
 
-    let elapsed_ms = start.elapsed().as_millis();
-    for (method, route) in planned {
-        info!(method, ?route, elapsed_ms, "handled");
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if planned.len() <= 1 {
+        for (method, route) in planned {
+            info!(
+                method,
+                ?route,
+                elapsed_ms = format!("{elapsed_ms:.3}"),
+                "handled"
+            );
+        }
+    } else {
+        // One wall-clock for the whole JSON-RPC batch — do not attribute it
+        // to every item (that looked like each method took the full duration).
+        info!(
+            batch_size = planned.len(),
+            elapsed_ms = format!("{elapsed_ms:.3}"),
+            "handled batch"
+        );
+        for (method, route) in planned {
+            info!(method, ?route, "batch item");
+        }
     }
 
     (StatusCode::OK, Json(packet_to_json(resp))).into_response()
