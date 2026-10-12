@@ -1,4 +1,5 @@
 mod clearnet_pir;
+mod ports;
 mod server;
 mod tor_pir_client;
 
@@ -9,7 +10,7 @@ use clearnet_pir::{ClearnetPirLookup, KeyMode as ClearnetKeyMode};
 use kohaku_pir_rpc::{PirRouter, PirTransport};
 use kohaku_privacy_rpc::{CachingAsyncLookup, PrivacyBuilder};
 use server::Backend;
-use tor_pir_client::{DEFAULT_POOL_SIZE, KeyMode as TorKeyMode, TorPirClientLookup};
+use tor_pir_client::{KeyMode as TorKeyMode, TorPirClientLookup, DEFAULT_POOL_SIZE};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -23,14 +24,10 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8545")]
     listen: String,
 
-    /// inspire-gpu-serving account PIR HTTP base URL (e.g. :18090).
+    /// Account PIR HTTP base URL, with an explicit port (e.g. `http://host:18090`).
+    /// Tokens are the same URL at port+1, primary names at port+2.
     #[arg(long, env = "PIR_URL")]
     pir_url: String,
-
-    /// inspire-gpu-serving token/storage PIR HTTP base URL (e.g. :18091).
-    /// When unset, ERC-20 balanceOf for the four default tokens falls back to RPC.
-    #[arg(long, env = "TOKEN_PIR_URL")]
-    token_pir_url: Option<String>,
 
     /// Fallback Ethereum JSON-RPC URL.
     #[arg(long, env = "ETH_RPC_URL")]
@@ -64,10 +61,18 @@ async fn main() {
         std::process::exit(1);
     }
 
+    let urls = match ports::derive_pir_urls(&args.pir_url) {
+        Ok(urls) => urls,
+        Err(e) => {
+            error!(error = %e, "PIR URL");
+            std::process::exit(1);
+        }
+    };
+
     let backend = if args.without_tor {
-        build_clearnet(&args)
+        build_clearnet(&args, &urls)
     } else {
-        build_tor(&args).await
+        build_tor(&args, &urls).await
     };
 
     let app = axum::Router::new()
@@ -83,8 +88,9 @@ async fn main() {
     };
     info!(
         listen = %args.listen,
-        pir = %args.pir_url,
-        token_pir = args.token_pir_url.as_deref().unwrap_or("(none)"),
+        accounts = %urls.accounts,
+        tokens = %urls.tokens,
+        names = %urls.names,
         fallback = %args.rpc_url,
         without_tor = args.without_tor,
         pir_pool_size = args.pir_pool_size,
@@ -100,54 +106,52 @@ async fn main() {
     }
 }
 
-fn build_clearnet(args: &Args) -> Arc<Backend> {
+fn build_clearnet(args: &Args, urls: &ports::PirUrls) -> Arc<Backend> {
     info!(
-        pir = %args.pir_url,
+        accounts = %urls.accounts,
+        tokens = %urls.tokens,
+        names = %urls.names,
         pool = args.pir_pool_size,
-        "clearnet mode: connecting PirClient pool (no Tor)"
+        "clearnet mode: connecting PirClient pools (no Tor)"
     );
-    let accounts = match ClearnetPirLookup::connect_with_mode(
-        &args.pir_url,
-        args.pir_pool_size,
-        ClearnetKeyMode::Account,
+    let accounts = connect_clearnet(&urls.accounts, args.pir_pool_size, ClearnetKeyMode::Account);
+    let tokens = connect_clearnet(&urls.tokens, args.pir_pool_size, ClearnetKeyMode::Storage);
+    let names = connect_clearnet(&urls.names, args.pir_pool_size, ClearnetKeyMode::Names);
+
+    let router = match PirRouter::with_rpc_lanes(
+        accounts,
+        Some(tokens),
+        Some(names),
+        &args.rpc_url,
+        Vec::new(),
     ) {
-        Ok(l) => l,
-        Err(e) => {
-            error!(error = %e, "account PirClient::connect failed");
-            std::process::exit(1);
-        }
-    };
-    info!(pool = accounts.pool_size(), "clearnet account PIR pool ready");
-    let accounts: Arc<dyn kohaku_pir_rpc::LookupBackend> = accounts;
-
-    let tokens = args.token_pir_url.as_ref().and_then(|url| {
-        if url.trim().is_empty() {
-            return None;
-        }
-        match ClearnetPirLookup::connect_with_mode(url, args.pir_pool_size, ClearnetKeyMode::Storage)
-        {
-            Ok(l) => {
-                info!(pool = l.pool_size(), token_pir = %url, "clearnet token PIR pool ready");
-                Some(l as Arc<dyn kohaku_pir_rpc::LookupBackend>)
-            }
-            Err(e) => {
-                error!(error = %e, "token PirClient::connect failed");
-                std::process::exit(1);
-            }
-        }
-    });
-
-    let router = match PirRouter::with_rpc_dual(accounts, tokens, &args.rpc_url, Vec::new()) {
         Ok(r) => Arc::new(r),
         Err(e) => {
-            error!(error = %e, "PirRouter::with_rpc_dual failed");
+            error!(error = %e, "PirRouter::with_rpc_lanes failed");
             std::process::exit(1);
         }
     };
     Arc::new(Backend::Clearnet(PirTransport::new(router)))
 }
 
-async fn build_tor(args: &Args) -> Arc<Backend> {
+fn connect_clearnet(
+    url: &str,
+    pool: usize,
+    mode: ClearnetKeyMode,
+) -> Arc<dyn kohaku_pir_rpc::LookupBackend> {
+    match ClearnetPirLookup::connect_with_mode(url, pool, mode) {
+        Ok(lookup) => {
+            info!(pool = lookup.pool_size(), %url, ?mode, "clearnet PIR pool ready");
+            lookup
+        }
+        Err(e) => {
+            error!(error = %e, %url, ?mode, "PirClient::connect failed");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn build_tor(args: &Args, urls: &ports::PirUrls) -> Arc<Backend> {
     info!("bootstrapping Tor (Arti)…");
     let tor = match kohaku_tor_rpc::TorRpc::connect().await {
         Ok(t) => t,
@@ -159,56 +163,38 @@ async fn build_tor(args: &Args) -> Arc<Backend> {
     info!("Tor ready");
 
     info!(
-        pir = %args.pir_url,
+        accounts = %urls.accounts,
+        tokens = %urls.tokens,
+        names = %urls.names,
         pool = args.pir_pool_size,
-        "connecting account PIR over Tor"
+        "connecting PIR pools over Tor"
     );
-    let accounts = match TorPirClientLookup::connect_with_mode(
+    let accounts = connect_tor(
         tor.clone(),
-        &args.pir_url,
+        &urls.accounts,
         args.pir_pool_size,
         TorKeyMode::Account,
     )
-    .await
-    {
-        Ok(l) => l,
-        Err(e) => {
-            error!(error = %e, "account PIR manifest over Tor failed");
-            std::process::exit(1);
-        }
-    };
-    info!(pool = accounts.pool_size(), "Tor account PIR pool ready");
-    let accounts = CachingAsyncLookup::with_default_ttl(accounts);
-
-    let tokens = if let Some(url) = args.token_pir_url.as_ref().filter(|u| !u.trim().is_empty()) {
-        info!(token_pir = %url, pool = args.pir_pool_size, "connecting token PIR over Tor");
-        match TorPirClientLookup::connect_with_mode(
-            tor.clone(),
-            url,
-            args.pir_pool_size,
-            TorKeyMode::Storage,
-        )
-        .await
-        {
-            Ok(l) => {
-                info!(pool = l.pool_size(), "Tor token PIR pool ready");
-                Some(CachingAsyncLookup::with_default_ttl(l)
-                    as Arc<dyn kohaku_privacy_rpc::AsyncLookupBackend>)
-            }
-            Err(e) => {
-                error!(error = %e, "token PIR manifest over Tor failed");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        info!("TOKEN_PIR_URL unset; USDC/USDT/DAI/WETH balanceOf will use fallback RPC");
-        None
-    };
+    .await;
+    let tokens = connect_tor(
+        tor.clone(),
+        &urls.tokens,
+        args.pir_pool_size,
+        TorKeyMode::Storage,
+    )
+    .await;
+    let names = connect_tor(
+        tor.clone(),
+        &urls.names,
+        args.pir_pool_size,
+        TorKeyMode::Names,
+    )
+    .await;
 
     let transport = match PrivacyBuilder::new(&args.rpc_url) {
         Ok(builder) => builder
             .tor(tor)
-            .pir_lookup(accounts, tokens, Vec::new())
+            .pir_lookup(accounts, Some(tokens), Some(names), Vec::new())
             .build_transport(),
         Err(e) => Err(e),
     };
@@ -216,6 +202,24 @@ async fn build_tor(args: &Args) -> Arc<Backend> {
         Ok(t) => Arc::new(Backend::Tor(t)),
         Err(e) => {
             error!(error = %e, "PrivacyBuilder failed");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn connect_tor(
+    tor: kohaku_tor_rpc::TorRpc,
+    url: &str,
+    pool: usize,
+    mode: TorKeyMode,
+) -> Arc<dyn kohaku_privacy_rpc::AsyncLookupBackend> {
+    match TorPirClientLookup::connect_with_mode(tor, url, pool, mode).await {
+        Ok(lookup) => {
+            info!(pool = lookup.pool_size(), %url, ?mode, "Tor PIR pool ready");
+            CachingAsyncLookup::with_default_ttl(lookup)
+        }
+        Err(e) => {
+            error!(error = %e, %url, ?mode, "PIR manifest over Tor failed");
             std::process::exit(1);
         }
     }

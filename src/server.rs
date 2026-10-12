@@ -1,19 +1,18 @@
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alloy::rpc::json_rpc::{
     ErrorPayload, Id, Request, RequestPacket, Response, ResponsePacket, ResponsePayload,
 };
 use alloy::transports::TransportError;
-use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use kohaku_pir_rpc::{PirTransport, RouteTable};
+use axum::Json;
+use kohaku_pir_rpc::{CallPath, CallTrace, PirTransport};
 use kohaku_privacy_rpc::PrivacyTransport;
-use serde_json::{Value, json};
-use tower::Service;
+use serde_json::{json, Value};
 use tracing::info;
 
 /// JSON-RPC backend: Tor+PIR orchestrator or clearnet pir-rpc.
@@ -26,23 +25,13 @@ pub enum Backend {
 }
 
 impl Backend {
-    fn routes(&self) -> &RouteTable {
+    async fn call(
+        &self,
+        packet: RequestPacket,
+    ) -> Result<(ResponsePacket, Vec<CallTrace>), TransportError> {
         match self {
-            Self::Tor(t) => t.router().routes(),
-            Self::Clearnet(t) => t.router().routes(),
-        }
-    }
-
-    async fn call(&self, packet: RequestPacket) -> Result<ResponsePacket, TransportError> {
-        match self {
-            Self::Tor(t) => {
-                let mut t = t.clone();
-                Service::call(&mut t, packet).await
-            }
-            Self::Clearnet(t) => {
-                let mut t = t.clone();
-                Service::call(&mut t, packet).await
-            }
+            Self::Tor(t) => t.call_logged(packet).await,
+            Self::Clearnet(t) => t.call_logged(packet).await,
         }
     }
 }
@@ -83,25 +72,12 @@ pub async fn handle_rpc(
         }
     };
 
-    let planned: Vec<_> = packet
-        .requests()
-        .iter()
-        .map(|req| {
-            let method = req.method().to_string();
-            let params = req
-                .params()
-                .map(|raw| serde_json::from_str(raw.get()).unwrap_or(Value::Null))
-                .unwrap_or(Value::Array(vec![]));
-            let route = backend.routes().classify(&method, &params);
-            (method, route)
-        })
-        .collect();
-
     let start = Instant::now();
-    let resp = match backend.call(packet).await {
-        Ok(r) => r,
+    let (resp, traces) = match backend.call(packet).await {
+        Ok(out) => out,
         Err(e) => {
-            info!(error = %e, elapsed_ms = format!("{:.3}", start.elapsed().as_secs_f64() * 1000.0), "transport error");
+            let elapsed = start.elapsed();
+            info!("error  {}  {e}", format_elapsed(elapsed));
             return (
                 StatusCode::OK,
                 Json(json!({
@@ -114,30 +90,45 @@ pub async fn handle_rpc(
         }
     };
 
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    if planned.len() <= 1 {
-        for (method, route) in planned {
-            info!(
-                method,
-                ?route,
-                elapsed_ms = format!("{elapsed_ms:.3}"),
-                "handled"
-            );
-        }
-    } else {
-        // One wall-clock for the whole JSON-RPC batch — do not attribute it
-        // to every item (that looked like each method took the full duration).
-        info!(
-            batch_size = planned.len(),
-            elapsed_ms = format!("{elapsed_ms:.3}"),
-            "handled batch"
-        );
-        for (method, route) in planned {
-            info!(method, ?route, "batch item");
-        }
-    }
+    log_traces(&traces, start.elapsed());
 
     (StatusCode::OK, Json(packet_to_json(resp))).into_response()
+}
+
+fn log_traces(traces: &[CallTrace], elapsed: Duration) {
+    if traces.len() <= 1 {
+        for trace in traces {
+            info!(
+                "{}  {}  {}",
+                trace.method,
+                path_word(trace.path),
+                format_elapsed(elapsed)
+            );
+        }
+        return;
+    }
+    info!("batch {}  {}", traces.len(), format_elapsed(elapsed));
+    for trace in traces {
+        info!("  {}  {}", trace.method, path_word(trace.path));
+    }
+}
+
+fn path_word(path: CallPath) -> &'static str {
+    match path {
+        CallPath::Pir => "pir",
+        CallPath::Fallback => "fallback",
+        CallPath::Local => "local",
+    }
+}
+
+/// `312ms` under a second, otherwise one decimal second (`1.4s`).
+fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 1.0 {
+        format!("{:.0}ms", secs * 1000.0)
+    } else {
+        format!("{secs:.1}s")
+    }
 }
 
 fn json_to_packet(body: &Value) -> Result<RequestPacket, String> {

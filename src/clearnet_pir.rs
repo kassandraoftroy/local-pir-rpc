@@ -13,6 +13,8 @@ pub enum KeyMode {
     Account,
     /// Pre-derived storage keys: pass through to `lookup` unchanged.
     Storage,
+    /// Primary names, keyed by the address on a `content = names` server.
+    Names,
 }
 
 /// Sync pool of clearnet [`PirClient`]s for concurrent `LookupBackend` calls.
@@ -48,6 +50,21 @@ impl ClearnetPirLookup {
             return Err("pir pool size must be >= 1".into());
         }
         let prototype = PirClient::connect(base)?;
+        match key_mode {
+            KeyMode::Names if prototype.manifest.cuckoo.content != "names" => {
+                return Err(format!(
+                    "expected a names PIR server at {base}, manifest content is {:?}",
+                    prototype.manifest.cuckoo.content
+                ));
+            }
+            KeyMode::Account if !prototype.manifest.cuckoo.content.is_empty() => {
+                return Err(format!(
+                    "expected an account PIR server at {base}, manifest content is {:?}",
+                    prototype.manifest.cuckoo.content
+                ));
+            }
+            _ => {}
+        }
         // PirClient is not Clone; reconnect for each pool member (same clearnet base).
         let mut clients = Vec::with_capacity(pool_size);
         clients.push(prototype);
@@ -70,10 +87,7 @@ impl ClearnetPirLookup {
     fn with_client<R>(&self, f: impl FnOnce(&mut PirClient) -> R) -> R {
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         while idle.is_empty() {
-            idle = self
-                .available
-                .wait(idle)
-                .unwrap_or_else(|e| e.into_inner());
+            idle = self.available.wait(idle).unwrap_or_else(|e| e.into_inner());
         }
         let mut client = idle.pop_front().expect("non-empty after wait");
         drop(idle);
@@ -97,6 +111,18 @@ impl ClearnetPirLookup {
                     }
                 }
                 KeyMode::Storage => client.lookup(key),
+                KeyMode::Names => {
+                    if client.manifest.cuckoo.content != "names" {
+                        Err("this server does not hold primary names".into())
+                    } else {
+                        let derived = client
+                            .manifest
+                            .cuckoo
+                            .key_derivation
+                            .key(key, client.manifest.cuckoo.key_size);
+                        client.lookup(&derived)
+                    }
+                }
             };
             result
                 .map(|found| found.map(|l| l.value))
@@ -110,10 +136,7 @@ impl LookupBackend for ClearnetPirLookup {
         self.lookup_key(key)
     }
 
-    fn lookup_batch(
-        &self,
-        keys: &[Vec<u8>],
-    ) -> Result<Vec<Option<Vec<u8>>>, PirProviderError> {
+    fn lookup_batch(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, PirProviderError> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }

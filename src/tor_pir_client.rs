@@ -58,6 +58,31 @@ impl TorPirClient {
 
     pub async fn lookup_address(&mut self, address: &[u8]) -> Result<Option<Vec<u8>>, String> {
         let cuckoo = &self.manifest.cuckoo;
+        if cuckoo.key_derivation == pir_keyword::manifest::KeyDerivation::Storage {
+            return Err("this server holds contract storage, not accounts".into());
+        }
+        if !cuckoo.content.is_empty() {
+            return Err(format!(
+                "this server holds {}, not accounts",
+                cuckoo.content
+            ));
+        }
+        let key = cuckoo.key_derivation.key(address, cuckoo.key_size);
+        self.lookup(&key).await
+    }
+
+    /// Manifest `content` (`""` for accounts, `"names"` for the name table).
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.manifest.cuckoo.content
+    }
+
+    /// Look up an address on a names server. Returns the raw 40-byte value.
+    pub async fn lookup_names(&mut self, address: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        if self.manifest.cuckoo.content != "names" {
+            return Err("this server does not hold primary names".into());
+        }
+        let cuckoo = &self.manifest.cuckoo;
         let key = cuckoo.key_derivation.key(address, cuckoo.key_size);
         self.lookup(&key).await
     }
@@ -69,9 +94,7 @@ impl TorPirClient {
                 self.refresh().await?;
                 match self.lookup_once(key).await? {
                     LookupOutcome::Done(v) => Ok(v),
-                    LookupOutcome::Reconfigured => {
-                        Err("server configuration kept changing".into())
-                    }
+                    LookupOutcome::Reconfigured => Err("server configuration kept changing".into()),
                 }
             }
         }
@@ -105,8 +128,7 @@ impl TorPirClient {
         let mut body = pack_query(&self.params, &q0.flat)?;
         body.extend_from_slice(&pack_query(&self.params, &q1.flat)?);
 
-        let lookup_url =
-            Url::parse(&format!("{}/lookup", self.base)).map_err(|e| e.to_string())?;
+        let lookup_url = Url::parse(&format!("{}/lookup", self.base)).map_err(|e| e.to_string())?;
         let resp = self
             .tor
             .http_shared(&lookup_url, "POST", &[], &body)
@@ -252,6 +274,8 @@ pub enum KeyMode {
     Account,
     /// Pre-derived storage keys: pass through to `lookup` unchanged.
     Storage,
+    /// Primary names, keyed by the address on a `content = names` server.
+    Names,
 }
 
 /// [`kohaku_privacy_rpc::AsyncLookupBackend`] over a pool of inspire PIR clients + Tor HTTP.
@@ -287,6 +311,21 @@ impl TorPirClientLookup {
             return Err("pir pool size must be >= 1".into());
         }
         let prototype = TorPirClient::connect(tor, base).await?;
+        match key_mode {
+            KeyMode::Names if prototype.content() != "names" => {
+                return Err(format!(
+                    "expected a names PIR server at {base}, manifest content is {:?}",
+                    prototype.content()
+                ));
+            }
+            KeyMode::Account if !prototype.content().is_empty() => {
+                return Err(format!(
+                    "expected an account PIR server at {base}, manifest content is {:?}",
+                    prototype.content()
+                ));
+            }
+            _ => {}
+        }
         let clients = (0..pool_size).map(|_| prototype.clone()).collect();
         Ok(Arc::new(Self {
             pool: ClientPool::new(clients),
@@ -312,6 +351,7 @@ impl TorPirClientLookup {
                 }
             }
             KeyMode::Storage => pooled.client_mut().lookup(key).await,
+            KeyMode::Names => pooled.client_mut().lookup_names(key).await,
         }
     }
 }

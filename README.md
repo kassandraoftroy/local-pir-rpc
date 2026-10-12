@@ -42,24 +42,33 @@ cargo run --release -- \
 kohaku <command> --rpc-url http://localhost:8545
 ```
 
-Watch logs: `eth_getBalance` / `eth_getTransactionCount` (latest) as PIR;
-`eth_chainId`, `eth_getLogs`, etc. as fallback.
+Watch logs for the method, the path that answered it, and the round trip:
+
+```
+eth_getBalance  pir  312ms
+batch 8  1.4s
+  eth_call  pir
+  eth_getLogs  fallback
+  eth_blockNumber  fallback
+```
+
+`pir` is an account, token, or names lookup. `fallback` is the public RPC (including a name that was too long for the table). `local` is `computeId`, which never leaves the process. A batch prints one elapsed time, then one line per call.
 
 ## Flags
 
 | Flag | Env | Default |
 |------|-----|---------|
 | `--listen` | | `127.0.0.1:8545` |
-| `--pir-url` | `PIR_URL` | *(required)* |
+| `--pir-url` | `PIR_URL` | *(required)* account server, explicit port. Tokens are port+1, names are port+2 (`http://host:18090` → `18090` / `18091` / `18092`). |
 | `--rpc-url` | `ETH_RPC_URL` | *(required)* |
-| `--pir-pool-size` | `PIR_POOL_SIZE` | `16` |
+| `--pir-pool-size` | `PIR_POOL_SIZE` | `2` |
 | `--without-tor` | | off (Tor on) |
 
 ### Concurrent PIR lookups
 
 A single `PirClient` behind a mutex serializes lookups (see
 [issue #1](https://github.com/kassandraoftroy/local-pir-rpc/issues/1)). Both
-modes keep a pool of clients (default 16) so concurrent lookups stay near one
+modes keep a pool of clients (default 2) so concurrent lookups stay near one
 lookup of latency.
 
 ## Dependencies
