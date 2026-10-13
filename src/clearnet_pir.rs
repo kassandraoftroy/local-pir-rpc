@@ -129,11 +129,62 @@ impl ClearnetPirLookup {
                 .map_err(PirProviderError::Client)
         })
     }
+
+    fn lookup_name(
+        &self,
+        key: &[u8],
+    ) -> Result<(Option<Vec<u8>>, kohaku_pir_rpc::StealthBroadcast), PirProviderError> {
+        self.with_client(|client| {
+            if client.manifest.cuckoo.content != "names" {
+                return Err(PirProviderError::Client(
+                    "this server does not hold primary names".into(),
+                ));
+            }
+            let derived = client
+                .manifest
+                .cuckoo
+                .key_derivation
+                .key(key, client.manifest.cuckoo.key_size);
+            let found = client.lookup(&derived).map_err(PirProviderError::Client)?;
+            let stealth = crate::stealth::broadcast_from_lists(
+                &client.stealth_registry,
+                &client.stealth_texts,
+            )
+            .map_err(PirProviderError::Client)?;
+            Ok((found.map(|lookup| lookup.value), stealth))
+        })
+    }
 }
 
 impl LookupBackend for ClearnetPirLookup {
     fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>, PirProviderError> {
         self.lookup_key(key)
+    }
+
+    fn lookup_names_batch(
+        &self,
+        keys: &[Vec<u8>],
+    ) -> Result<kohaku_pir_rpc::NamesLookupBatch, PirProviderError> {
+        if keys.is_empty() || !matches!(self.key_mode, KeyMode::Names) {
+            return Ok(kohaku_pir_rpc::NamesLookupBatch {
+                values: self.lookup_batch(keys)?,
+                stealth: None,
+            });
+        }
+        std::thread::scope(|s| {
+            let handles: Vec<_> = keys
+                .iter()
+                .map(|key| s.spawn(|| self.lookup_name(key)))
+                .collect();
+            let mut values = Vec::with_capacity(keys.len());
+            let mut stealth = None;
+            for handle in handles {
+                let (value, broadcast) = handle.join().expect("lookup worker panicked")?;
+                stealth = Some(broadcast);
+                values.push(value);
+            }
+            Ok(kohaku_pir_rpc::NamesLookupBatch { values, stealth })
+        })
     }
 
     fn lookup_batch(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, PirProviderError> {

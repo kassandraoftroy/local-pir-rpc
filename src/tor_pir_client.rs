@@ -77,23 +77,33 @@ impl TorPirClient {
         &self.manifest.cuckoo.content
     }
 
-    /// Look up an address on a names server. Returns the raw 40-byte value.
-    pub async fn lookup_names(&mut self, address: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    /// Look up an address on a names server. Returns the raw value and the sidecar lists.
+    pub async fn lookup_names(
+        &mut self,
+        address: &[u8],
+    ) -> Result<(Option<Vec<u8>>, kohaku_pir_rpc::StealthBroadcast), String> {
         if self.manifest.cuckoo.content != "names" {
             return Err("this server does not hold primary names".into());
         }
         let cuckoo = &self.manifest.cuckoo;
         let key = cuckoo.key_derivation.key(address, cuckoo.key_size);
-        self.lookup(&key).await
+        self.lookup_with_stealth(&key).await
     }
 
     pub async fn lookup(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        Ok(self.lookup_with_stealth(key).await?.0)
+    }
+
+    async fn lookup_with_stealth(
+        &mut self,
+        key: &[u8],
+    ) -> Result<(Option<Vec<u8>>, kohaku_pir_rpc::StealthBroadcast), String> {
         match self.lookup_once(key).await? {
-            LookupOutcome::Done(v) => Ok(v),
+            LookupOutcome::Done { value, stealth } => Ok((value, stealth)),
             LookupOutcome::Reconfigured => {
                 self.refresh().await?;
                 match self.lookup_once(key).await? {
-                    LookupOutcome::Done(v) => Ok(v),
+                    LookupOutcome::Done { value, stealth } => Ok((value, stealth)),
                     LookupOutcome::Reconfigured => Err("server configuration kept changing".into()),
                 }
             }
@@ -131,20 +141,25 @@ impl TorPirClient {
         let lookup_url = Url::parse(&format!("{}/lookup", self.base)).map_err(|e| e.to_string())?;
         let resp = self
             .tor
-            .http_shared(&lookup_url, "POST", &[], &body)
+            .http(&lookup_url, "POST", &[], &body)
             .await
             .map_err(|e| format!("lookup over Tor: {e}"))?;
-        if resp.status != 200 {
-            return Err(format!("lookup HTTP {}", resp.status));
+        if resp.status().as_u16() != 200 {
+            return Err(format!("lookup HTTP {}", resp.status()));
         }
-        if resp.body.len() > MAX_RESPONSE_BYTES {
-            return Err("lookup response too large".into());
-        }
-        let stamp = resp.header("x-snapshot").unwrap_or("");
+        let stamp = resp
+            .headers()
+            .get("x-snapshot")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         if stamp.split(':').nth(1) != Some(self.manifest.config_fp().as_str()) {
             return Ok(LookupOutcome::Reconfigured);
         }
-        let bytes = &resp.body;
+        let bytes = resp.into_body();
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err("lookup response too large".into());
+        }
 
         let rb = self.params.response_compressed_bytes();
         if bytes.len() < 4 {
@@ -160,6 +175,8 @@ impl TorPirClient {
         let sc = SidecarBroadcast::from_json(
             std::str::from_utf8(&bytes[4..4 + json_len]).map_err(|e| e.to_string())?,
         )?;
+        let stealth =
+            crate::stealth::broadcast_from_lists(&sc.stealth_registry, &sc.stealth_texts)?;
 
         let r0 = &bytes[4 + json_len..4 + json_len + rb];
         let r1 = &bytes[4 + json_len + rb..];
@@ -175,9 +192,10 @@ impl TorPirClient {
             .rev()
             .find(|e| hex::decode(&e.address_hex).as_deref() == Ok(key))
         {
-            return Ok(LookupOutcome::Done(Some(
-                hex::decode(&e.value_hex).map_err(|x| x.to_string())?,
-            )));
+            return Ok(LookupOutcome::Done {
+                value: Some(hex::decode(&e.value_hex).map_err(|x| x.to_string())?),
+                stealth,
+            });
         }
         let mut found = self
             .match_cell(&b0, key)
@@ -191,12 +209,18 @@ impl TorPirClient {
                 found = Some(hex::decode(&e.value_hex).map_err(|x| x.to_string())?);
             }
         }
-        Ok(LookupOutcome::Done(found))
+        Ok(LookupOutcome::Done {
+            value: found,
+            stealth,
+        })
     }
 }
 
 enum LookupOutcome {
-    Done(Option<Vec<u8>>),
+    Done {
+        value: Option<Vec<u8>>,
+        stealth: kohaku_pir_rpc::StealthBroadcast,
+    },
     Reconfigured,
 }
 
@@ -351,7 +375,7 @@ impl TorPirClientLookup {
                 }
             }
             KeyMode::Storage => pooled.client_mut().lookup(key).await,
-            KeyMode::Names => pooled.client_mut().lookup_names(key).await,
+            KeyMode::Names => pooled.client_mut().lookup_names(key).await.map(|(v, _)| v),
         }
     }
 }
@@ -377,6 +401,31 @@ impl kohaku_privacy_rpc::AsyncLookupBackend for TorPirClientLookup {
             .into_iter()
             .map(|r| r.map_err(kohaku_pir_rpc::PirProviderError::Client))
             .collect()
+    }
+
+    async fn lookup_names_batch(
+        &self,
+        keys: &[Vec<u8>],
+    ) -> Result<kohaku_pir_rpc::NamesLookupBatch, kohaku_pir_rpc::PirProviderError> {
+        if keys.is_empty() {
+            return Ok(kohaku_pir_rpc::NamesLookupBatch::default());
+        }
+        let futs = keys.iter().map(|key| {
+            let key = key.clone();
+            async move {
+                let mut pooled = self.pool.checkout().await;
+                pooled.client_mut().lookup_names(&key).await
+            }
+        });
+        let results = futures::future::join_all(futs).await;
+        let mut values = Vec::with_capacity(keys.len());
+        let mut stealth = None;
+        for result in results {
+            let (value, broadcast) = result.map_err(kohaku_pir_rpc::PirProviderError::Client)?;
+            stealth = Some(broadcast);
+            values.push(value);
+        }
+        Ok(kohaku_pir_rpc::NamesLookupBatch { values, stealth })
     }
 }
 

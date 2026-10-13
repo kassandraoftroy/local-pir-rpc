@@ -1,6 +1,7 @@
 mod clearnet_pir;
 mod ports;
 mod server;
+mod stealth;
 mod tor_pir_client;
 
 use std::sync::Arc;

@@ -50,10 +50,10 @@ batch 8  1.4s
   eth_call  pir  balanceOf  0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
   eth_getLogs  fallback
   eth_blockNumber  fallback
-eth_call  fallback  148ms  stealthMetaAddressOf  0x6538E6bf4B0eBd30A8Ea093027Ac2422ce5d6538
+eth_call  local  1ms  stealthMetaAddressOf  0x6538E6bf4B0eBd30A8Ea093027Ac2422ce5d6538
 ```
 
-`pir` is an account, token, or names lookup. `fallback` is the public RPC (including a name that was too long for the table). `local` is `computeId`, which never leaves the process. A batch prints one elapsed time, then one line per call. An `eth_call` line also names the function and the contract.
+`pir` is an account, token, or names lookup. The first `stealthMetaAddressOf` or `stealth-address-scheme-1` text read in a session is `pir` while it loads the names sidecar; later ones are `local`. `fallback` is the public RPC (including a name that was too long for the table, or a text record other than `stealth-address-scheme-1`). `local` is `computeId` or a stealth answer taken from the names sidecar, which never leaves the process. A batch prints one elapsed time, then one line per call. An `eth_call` line also names the function and the contract.
 
 ## Flags
 
