@@ -1,15 +1,18 @@
 # local-pir-rpc
 
-A localhost Ethereum JSON-RPC for wallets. Point a wallet at `http://127.0.0.1:8545`.
+Privacy-conscious localhost Ethereum JSON-RPC middleware. Run it on your machine and point a wallet at `http://127.0.0.1:8545` instead of a traditional RPC endpoint.
 
-This is not an Ethereum node. It answers JSON-RPC from a process on your machine.
-Historical and non-PIR reads go to a baked-in ring of public endpoints and are
-checked by an in-process [Helios](https://github.com/a16z/helios) light client.
-Optional PIR answers account, token, and name reads without sending those keys
-to a public node.
+A traditional endpoint sees your IP together with every address, balance, log, and contract you read - linking them all together. This process sits in between. It uses Tor, PIR, and a ring of public Ethereum RPC endpoints so that no single party gets that whole picture and your reads of ethereum chain are maximally obfuscated from any observer.
 
-Public RPC traffic leaves through Tor by default. `--without-tor` dials the same
-ring in clearnet.
+## What a wallet read goes through
+
+**PIR** answers account, token, and name lookups. The PIR server sees that a lookup happened. The key stays on your machine. Those keys stay off the public ring as well: re-checking a PIR hit against a public node would reveal the key and undo the lookup.
+
+**Tor** carries traffic that has to leave the machine: PIR queries, and the public RPC calls below. An exit node sees the destination. Your IP stays on your machine.
+
+**A ring of public endpoints** serves everything PIR does not: blocks, logs, gas, and calls outside the private tables. Each request picks a provider at random (PublicNode, Ankr, Cloudflare, 1RPC, dRPC, BlockPI, and Alchemy's public mainnet URL). A failure retries a different provider, up to three times. One company does not hold a complete log of your reads.
+
+**A Helios light client** makes those public reads verifiable. The endpoints are ordinary public RPCs and any of them can lie. Helios checks their answers against the beacon chain, so a malicious provider cannot hand the wallet a forged balance, log, or state root inside the window it certifies. The client is pinned to a checkpoint about twelve days old. Calls older than that execution block fail with JSON-RPC error `-32000` and the message `block is outside the light-client window`. `latest`, `safe`, `finalized`, and `pending` stay inside the window.
 
 ## Run
 
@@ -17,96 +20,51 @@ ring in clearnet.
 cargo run --release
 ```
 
-The first start fetches a beacon checkpoint about twelve days old and syncs
-Helios from it. That can take several minutes, longer over Tor. The checkpoint
-is stored in `~/.local-pir-rpc` (or `$LOCAL_PIR_RPC_DIR`) and reused until it
-is about thirteen days old.
+The first start bootstraps Tor, fetches the checkpoint, and syncs Helios. That can take several minutes. The checkpoint is kept in `~/.local-pir-rpc` (or `$LOCAL_PIR_RPC_DIR`) and reused until it is about thirteen days old.
 
-Wallets and scripts then use:
+Then set the wallet RPC URL to `http://127.0.0.1:8545`.
 
-```text
-http://127.0.0.1:8545
-```
-
-Calls whose block is older than the pinned checkpoint fail with JSON-RPC error
-`-32000`, message `block is outside the light-client window`. `latest`, `safe`,
-`finalized`, and `pending` stay inside the window. A log range that starts
-below the window is rejected rather than clipped.
-
-## Optional PIR
+PIR is on when you pass a server:
 
 ```bash
 cargo run --release -- --pir-url "https://your-pir-endpoint.example"
 ```
 
-The account server uses the port you pass. Tokens are that port plus one, names
-plus two (`http://host:18090` → `18090` / `18091` / `18092`). PIR traffic uses
-Tor unless you pass `--without-tor`. Without `--pir-url`, every call is a
-Helios-verified public read.
+The account server uses the port you pass. Tokens are that port plus one, names plus two (`http://host:18090` → `18090` / `18091` / `18092`).
 
-## Extra public endpoints
+## Turning pieces off
 
-The built-in execution ring is PublicNode, Ankr, Cloudflare, 1RPC, dRPC,
-BlockPI, and Alchemy's public mainnet URL. Each fallback picks a provider at
-random and retries a different provider up to three times. Add more with a
-repeatable flag:
+Tor and PIR are how the middleware earns its privacy, and both can be disabled.
+
+`--without-tor` dials the public ring and the PIR server in clearnet. Your IP is visible to whoever you contact.
+
+Omit `--pir-url` and every read goes to the public ring, still over Tor and still checked by Helios. Providers see the addresses and contracts in those calls.
+
+Add your own execution endpoints with a repeatable flag. They join the same ring:
 
 ```bash
 cargo run --release -- \
-  --extra-rpc-url "https://your-mainnet-rpc.example" \
-  --extra-rpc-url "https://another.example"
+  --extra-rpc-url "https://your-mainnet-rpc.example"
 ```
-
-## Clearnet
-
-```bash
-cargo run --release -- --without-tor
-```
-
-## Logs
-
-```text
-eth_getBalance  pir  312ms
-batch 8  1.4s
-  eth_call  pir  balanceOf  0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
-  eth_getLogs  helios
-  eth_blockNumber  helios
-eth_call  local  1ms  stealthMetaAddressOf  0x6538E6bf4B0eBd30A8Ea093027Ac2422ce5d6538
-```
-
-`pir` is an account, token, or names lookup. The first `stealthMetaAddressOf` or
-`stealth-address-scheme-1` text read in a session is `pir` while it loads the
-names sidecar; later ones are `local`. `helios` is a public-ring read checked by
-the light client (including a name that was too long for the table, or a text
-record other than `stealth-address-scheme-1`). `local` is `computeId` or a
-stealth answer taken from the names sidecar, which never leaves the process.
-A batch prints one elapsed time, then one line per call. An `eth_call` line
-also names the function and the contract.
 
 ## Flags
 
 | Flag | Env | Default |
 |------|-----|---------|
 | `--listen` | | `127.0.0.1:8545` |
-| `--pir-url` | `PIR_URL` | unset (Helios only). Account server, explicit port. Tokens are port+1, names are port+2. |
-| `--extra-rpc-url` | | none. Repeat to append execution endpoints to the public ring. |
+| `--pir-url` | `PIR_URL` | unset. Account server, explicit port. Tokens are port+1, names are port+2. |
+| `--extra-rpc-url` | | none. Repeat to append execution endpoints to the ring. |
 | `--pir-pool-size` | `PIR_POOL_SIZE` | `2` |
 | `--without-tor` | | off (Tor on) |
 
-Checkpoint and Helios data live in `$LOCAL_PIR_RPC_DIR` or `~/.local-pir-rpc`.
+## Logs
 
-### Concurrent PIR lookups
+```text
+eth_getBalance  pir  312ms
+eth_getLogs  helios
+eth_call  local  1ms  stealthMetaAddressOf  0x6538E6bf4B0eBd30A8Ea093027Ac2422ce5d6538
+```
 
-A single `PirClient` behind a mutex serializes lookups (see
-[issue #1](https://github.com/kassandraoftroy/local-pir-rpc/issues/1)). Both
-modes keep a pool of clients (default 2) so concurrent lookups stay near one
-lookup of latency.
+`pir` is an account, token, or names lookup. `helios` is a public-ring read the light client checked. `local` was answered from data already in the process (a `computeId`, or a stealth record taken from the names sidecar) and did not leave the machine.
 
-## Dependencies
-
-The crates this binary links are vendored under `vendor/`:
-
-- `vendor/kohaku-rs/{privacy-rpc,tor-rpc,pir-rpc}`
-- `vendor/inspire/crates/{client,backend-ffi,keyword}` and `vendor/inspire/third_party/inspire-gpu`
-
-`vendor/UPSTREAM.txt` records the upstream commits.
+The crates this binary links are vendored under `vendor/`. `vendor/UPSTREAM.txt` records the upstream commits.
