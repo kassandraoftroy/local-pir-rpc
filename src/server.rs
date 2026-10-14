@@ -10,29 +10,31 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use kohaku_pir_rpc::{CallPath, CallTrace, PirTransport};
+use kohaku_pir_rpc::{CallPath, CallTrace};
 use kohaku_privacy_rpc::PrivacyTransport;
 use serde_json::{json, Value};
 use tracing::info;
 
-/// JSON-RPC backend: Tor+PIR orchestrator or clearnet pir-rpc.
+/// JSON-RPC backend. Fallback is the in-process Helios client.
 #[derive(Clone)]
-pub enum Backend {
-    /// All egress via Tor ([`PrivacyTransport`]).
-    Tor(PrivacyTransport),
-    /// Clearnet PIR + clearnet fallback RPC ([`PirTransport`]).
-    Clearnet(PirTransport),
+pub struct Backend {
+    transport: PrivacyTransport,
 }
 
 impl Backend {
+    pub fn new(transport: PrivacyTransport) -> Self {
+        Self { transport }
+    }
+
+    pub fn transport(&self) -> &PrivacyTransport {
+        &self.transport
+    }
+
     async fn call(
         &self,
         packet: RequestPacket,
     ) -> Result<(ResponsePacket, Vec<CallTrace>), TransportError> {
-        match self {
-            Self::Tor(t) => t.call_logged(packet).await,
-            Self::Clearnet(t) => t.call_logged(packet).await,
-        }
+        self.transport.call_logged(packet).await
     }
 }
 
@@ -216,7 +218,7 @@ fn decode_hex(data: &str) -> Vec<u8> {
 fn path_word(path: CallPath) -> &'static str {
     match path {
         CallPath::Pir => "pir",
-        CallPath::Fallback => "fallback",
+        CallPath::Fallback => "helios",
         CallPath::Local => "local",
     }
 }
