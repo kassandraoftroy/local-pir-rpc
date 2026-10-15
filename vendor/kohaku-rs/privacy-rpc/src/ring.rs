@@ -1,23 +1,18 @@
 //! Baked-in public Ethereum execution and beacon endpoints.
 //!
 //! Each fallback attempt picks a random provider and, on failure, retries a
-//! different registrable domain, up to three times.
+//! different registrable domain until one answers.
 
 use url::Url;
 
 use crate::PrivacyError;
 
-/// Public execution JSON-RPC endpoints. Two `PublicNode` hosts share a domain,
-/// so a retry will not treat them as independent providers.
+/// Public execution JSON-RPC endpoints. Each host is a different provider, so a
+/// retry leaves the one that just failed.
 pub const EXECUTION_URLS: &[&str] = &[
-    "https://ethereum-rpc.publicnode.com",
     "https://ethereum.publicnode.com",
-    "https://rpc.ankr.com/eth",
-    "https://cloudflare-eth.com",
-    "https://1rpc.io/eth",
     "https://eth.drpc.org",
-    "https://ethereum.blockpi.network/v1/rpc/public",
-    "https://eth-mainnet.g.alchemy.com/public",
+    "https://1rpc.io/eth",
 ];
 
 /// Public beacon APIs that serve the light-client routes Helios needs.

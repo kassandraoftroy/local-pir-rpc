@@ -124,7 +124,7 @@ async fn forward(State(state): State<ProxyState>, req: axum::extract::Request) -
         .iter()
         .filter_map(|(name, value)| {
             let name = name.as_str();
-            if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("content-length") {
+            if !forward_header(name) {
                 return None;
             }
             Some((name.to_string(), value.to_str().ok()?.to_string()))
@@ -137,7 +137,7 @@ async fn forward(State(state): State<ProxyState>, req: axum::extract::Request) -
         .map(http_body_util::Collected::to_bytes)
         .unwrap_or_default();
     let isolated = state.execution && wants_isolated(&body);
-    let attempts = crate::ring::distinct_attempts(state.urls.as_slice(), crate::ring::MAX_ATTEMPTS);
+    let attempts = crate::ring::distinct_attempts(state.urls.as_slice(), state.urls.len());
     let mut last = "no providers configured".to_string();
     for url in attempts {
         let target = target_url(&url, &path, state.execution);
@@ -154,7 +154,7 @@ async fn forward(State(state): State<ProxyState>, req: axum::extract::Request) -
         )
         .await
         {
-            Ok(Ok((status, _bytes))) if should_retry(status) => {
+            Ok(Ok((status, bytes))) if provider_rejected(status, &bytes) => {
                 last = format!("{target} HTTP {status}");
                 warn!(%target, %status, "public rpc failed; trying another provider");
             }
@@ -175,11 +175,11 @@ async fn forward(State(state): State<ProxyState>, req: axum::extract::Request) -
             }
         }
     }
-    (
-        StatusCode::BAD_GATEWAY,
-        format!("public rpc ring exhausted: {last}"),
-    )
-        .into_response()
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(ring_exhausted(&body, &last)))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
 fn wants_isolated(body: &[u8]) -> bool {
@@ -198,8 +198,96 @@ fn wants_isolated(body: &[u8]) -> bool {
     })
 }
 
-fn should_retry(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+fn forward_header(name: &str) -> bool {
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "content-length"
+            | "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+            | "accept-encoding"
+    )
+}
+
+/// A gateway rejected the call, or the body is not JSON. Real execution
+/// errors (`execution reverted`, bad params) are returned to the wallet.
+fn provider_rejected(status: StatusCode, body: &[u8]) -> bool {
+    if matches!(status.as_u16(), 401 | 403 | 408 | 429 | 500 | 502 | 503 | 504) {
+        return true;
+    }
+    if !(status.is_success() || status.as_u16() == 400) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return true;
+    };
+    let items = match &value {
+        Value::Array(items) => items.as_slice(),
+        other => std::slice::from_ref(other),
+    };
+    !items.is_empty() && items.iter().all(is_provider_rejection)
+}
+
+fn is_provider_rejection(item: &Value) -> bool {
+    let Some(err) = item.get("error") else {
+        return false;
+    };
+    if err.get("code").and_then(Value::as_i64) == Some(-32_005) {
+        return true;
+    }
+    let message = err
+        .get("message")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let lower = message.to_ascii_lowercase();
+    [
+        "api key",
+        "apikey",
+        "unauthorized",
+        "rate limit",
+        "too many request",
+        "quota",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn ring_exhausted(request_body: &[u8], last: &str) -> Vec<u8> {
+    let error = serde_json::json!({
+        "code": -32603,
+        "message": format!("public rpc ring exhausted: {last}"),
+    });
+    let response = match serde_json::from_slice::<Value>(request_body) {
+        Ok(Value::Array(items)) => Value::Array(
+            items
+                .iter()
+                .map(|item| {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": item.get("id").cloned().unwrap_or(Value::Null),
+                        "error": error.clone(),
+                    })
+                })
+                .collect(),
+        ),
+        Ok(item) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": item.get("id").cloned().unwrap_or(Value::Null),
+            "error": error,
+        }),
+        Err(_) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": error,
+        }),
+    };
+    serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec())
 }
 
 /// Execution posts use `base` unchanged. Beacon calls append `incoming`.
@@ -274,7 +362,7 @@ impl RpcOutbound {
                 let resp = tor
                     .http(url, method, headers, body)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| format!("{e:#}"))?;
                 let status = resp.status();
                 let bytes = resp.into_body().to_vec();
                 Ok((status, bytes))
@@ -292,6 +380,26 @@ mod tests {
         let base = Url::parse("https://ethereum.blockpi.network/v1/rpc/public").unwrap();
         let got = target_url(&base, "/eth/v1/beacon/headers/head", true);
         assert_eq!(got.as_str(), base.as_str());
+    }
+
+    #[test]
+    fn ankr_style_auth_error_is_retried() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Unauthorized: You must authenticate your request with an API key."}}"#;
+        assert!(provider_rejected(StatusCode::OK, body));
+    }
+
+    #[test]
+    fn execution_revert_is_not_retried() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}}"#;
+        assert!(!provider_rejected(StatusCode::OK, body));
+    }
+
+    #[test]
+    fn exhausted_ring_is_json_rpc() {
+        let raw = ring_exhausted(br#"{"jsonrpc":"2.0","id":7,"method":"eth_chainId"}"#, "down");
+        let value: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(value["id"], 7);
+        assert!(value["error"]["message"].as_str().unwrap().contains("down"));
     }
 
     #[test]
