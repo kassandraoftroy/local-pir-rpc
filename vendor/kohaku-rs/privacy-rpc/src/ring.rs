@@ -12,7 +12,7 @@ use crate::PrivacyError;
 pub const EXECUTION_URLS: &[&str] = &[
     "https://ethereum.publicnode.com",
     "https://eth.drpc.org",
-    "https://1rpc.io/eth",
+    "https://eth.llamarpc.com",
 ];
 
 /// Public beacon APIs that serve the light-client routes Helios needs.

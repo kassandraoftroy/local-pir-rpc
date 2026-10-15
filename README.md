@@ -10,7 +10,7 @@ A traditional endpoint sees your IP together with every address, balance, log, a
 
 **Tor** carries traffic that has to leave the machine: PIR queries, and the public RPC calls below. An exit node sees the destination. Your IP stays on your machine.
 
-**A ring of public endpoints** serves everything PIR does not: blocks, logs, gas, and calls outside the private tables. Each request picks a provider at random (PublicNode, dRPC, or 1RPC). A failure, including a gateway that demands an API key, tries a different provider until one answers. One company does not hold a complete log of your reads.
+**A ring of public endpoints** serves everything PIR does not: blocks, logs, gas, and calls outside the private tables. Each request picks a provider at random (PublicNode, dRPC, or LlamaRPC). A failure, including a gateway that demands an API key, tries a different provider until one answers. One company does not hold a complete log of your reads.
 
 **A Helios light client** makes those public reads verifiable. The endpoints are ordinary public RPCs and any of them can lie. Helios checks their answers against the beacon chain, so a malicious provider cannot hand the wallet a forged balance, log, or state root inside the window it certifies. The client is pinned to a checkpoint about twelve days old. Calls older than that execution block fail with JSON-RPC error `-32000` and the message `block is outside the light-client window`. `latest`, `safe`, `finalized`, and `pending` stay inside the window. This check is on by default. `--without-light-client` skips it: the same ring still answers, and a lying endpoint can go unnoticed. The history window stays open in that mode.
 
