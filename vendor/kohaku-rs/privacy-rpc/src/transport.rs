@@ -50,6 +50,8 @@ pub struct PrivacyTransport {
     local_fallback: bool,
     /// Keeps the Helios process-side client and its proxies alive.
     verified: Option<Arc<crate::verified::VerifiedRpc>>,
+    /// Keeps the unverified execution-ring proxy alive.
+    ring: Option<Arc<crate::proxy::LocalProxy>>,
 }
 
 impl PrivacyTransport {
@@ -77,6 +79,7 @@ impl PrivacyTransport {
             verifier,
             local_fallback: false,
             verified: None,
+            ring: None,
         }
     }
 
@@ -98,6 +101,19 @@ impl PrivacyTransport {
     #[must_use]
     pub fn verified(&self) -> Option<&crate::verified::VerifiedRpc> {
         self.verified.as_deref()
+    }
+
+    /// Hold the execution-ring proxy used when Helios is off.
+    #[must_use]
+    pub fn hold_ring(mut self, proxy: Arc<crate::proxy::LocalProxy>) -> Self {
+        self.ring = Some(proxy);
+        self
+    }
+
+    /// Fallback is the public ring directly, with no light client.
+    #[must_use]
+    pub fn unverified_ring(&self) -> bool {
+        self.ring.is_some()
     }
 
     /// Backward-compatible constructor: one lookup for account and token lanes.
@@ -480,6 +496,7 @@ impl PrivacyTransport {
         }
 
         let local_fallback = self.local_fallback;
+        let via_helios = self.verified.is_some();
         let futs = groups.into_iter().map(|(choice, items)| {
             let tor = Arc::clone(&self.tor);
             let url = self.rpc_url.clone();
@@ -487,7 +504,11 @@ impl PrivacyTransport {
                 let count = items.len();
                 let (packet, group) = pack_circuit_group(items)?;
                 let resp_packet = if local_fallback {
-                    debug!(?choice, jobs = count, "fallback RPC via Helios");
+                    if via_helios {
+                        debug!(?choice, jobs = count, "fallback RPC via Helios");
+                    } else {
+                        debug!(?choice, jobs = count, "fallback RPC via public ring");
+                    }
                     post_local(&url, packet).await?
                 } else {
                     debug!(

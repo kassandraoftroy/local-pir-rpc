@@ -448,3 +448,17 @@ impl LookupBackend for CountingLookup {
         self.inner.lookup_batch(keys)
     }
 }
+
+#[tokio::test]
+async fn unverified_ring_skips_helios_and_the_window() {
+    let transport = PrivacyBuilder::new()
+        .without_tor()
+        .open_unverified(crate::RpcOutbound::Clearnet)
+        .await
+        .unwrap()
+        .build_transport()
+        .unwrap();
+    assert!(transport.verified().is_none());
+    assert!(transport.unverified_ring());
+    assert!(transport.router().oldest_block().is_none());
+}

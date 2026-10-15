@@ -20,7 +20,8 @@ Batch-aware privacy orchestrator that composes **Tor** (`kohaku-tor-rpc`) and
    Helios pulls proofs from a rotating ring of public execution and beacon
    endpoints. Those fetches egress through Tor (or clearnet when Tor is off).
    A call older than the pinned checkpoint returns
-   `block is outside the light-client window`.
+   `block is outside the light-client window`. `open_unverified` skips Helios
+   and posts those calls at the execution-ring proxy directly.
 4. **Selective isolation** — bulk/metadata methods share a Tor circuit;
    address-bearing fallbacks are grouped by EOA onto isolated circuits.
 5. **Multicall3 packing** — within each circuit group, eligible `eth_call` /
