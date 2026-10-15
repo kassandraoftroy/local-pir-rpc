@@ -6,6 +6,7 @@
 //! [kassandraoftroy/local-pir-rpc#1](https://github.com/kassandraoftroy/local-pir-rpc/issues/1)).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kohaku_tor_rpc::TorRpc;
@@ -30,6 +31,8 @@ pub struct TorPirClient {
     manifest: Manifest,
     params: Params,
     hasher: CuckooHash,
+    /// Snapshot block of the last completed lookup. `0` until one finishes.
+    snapshot_block: u64,
 }
 
 impl TorPirClient {
@@ -53,6 +56,7 @@ impl TorPirClient {
             manifest,
             params,
             hasher,
+            snapshot_block: 0,
         })
     }
 
@@ -69,6 +73,12 @@ impl TorPirClient {
         }
         let key = cuckoo.key_derivation.key(address, cuckoo.key_size);
         self.lookup(&key).await
+    }
+
+    /// Block the last lookup's snapshot reflects. `0` before the first lookup.
+    #[must_use]
+    pub const fn snapshot_block(&self) -> u64 {
+        self.snapshot_block
     }
 
     /// Manifest `content` (`""` for accounts, `"names"` for the name table).
@@ -175,8 +185,12 @@ impl TorPirClient {
         let sc = SidecarBroadcast::from_json(
             std::str::from_utf8(&bytes[4..4 + json_len]).map_err(|e| e.to_string())?,
         )?;
-        let stealth =
-            crate::stealth::broadcast_from_lists(&sc.stealth_registry, &sc.stealth_texts)?;
+        self.snapshot_block = sc.snapshot_block;
+        let stealth = crate::stealth::broadcast_from_lists(
+            &sc.stealth_registry,
+            &sc.stealth_texts,
+            sc.snapshot_block,
+        )?;
 
         let r0 = &bytes[4 + json_len..4 + json_len + rb];
         let r1 = &bytes[4 + json_len + rb..];
@@ -307,6 +321,8 @@ pub struct TorPirClientLookup {
     pool: ClientPool,
     pool_size: usize,
     key_mode: KeyMode,
+    /// Highest snapshot block any pooled client has reported. `0` means unknown.
+    snapshot_block: AtomicU64,
 }
 
 impl TorPirClientLookup {
@@ -355,6 +371,7 @@ impl TorPirClientLookup {
             pool: ClientPool::new(clients),
             pool_size,
             key_mode,
+            snapshot_block: AtomicU64::new(0),
         }))
     }
 
@@ -364,9 +381,15 @@ impl TorPirClientLookup {
         self.pool_size
     }
 
+    fn record_snapshot(&self, block: u64) {
+        if block > 0 {
+            self.snapshot_block.fetch_max(block, Ordering::Relaxed);
+        }
+    }
+
     async fn lookup_one(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
         let mut pooled = self.pool.checkout().await;
-        match self.key_mode {
+        let result = match self.key_mode {
             KeyMode::Account => {
                 if key.len() == 20 {
                     pooled.client_mut().lookup_address(key).await
@@ -376,12 +399,21 @@ impl TorPirClientLookup {
             }
             KeyMode::Storage => pooled.client_mut().lookup(key).await,
             KeyMode::Names => pooled.client_mut().lookup_names(key).await.map(|(v, _)| v),
-        }
+        };
+        self.record_snapshot(pooled.client_mut().snapshot_block());
+        result
     }
 }
 
 #[async_trait::async_trait]
 impl kohaku_privacy_rpc::AsyncLookupBackend for TorPirClientLookup {
+    fn last_snapshot_block(&self) -> Option<u64> {
+        match self.snapshot_block.load(Ordering::Relaxed) {
+            0 => None,
+            block => Some(block),
+        }
+    }
+
     async fn lookup_batch(
         &self,
         keys: &[Vec<u8>],
@@ -422,6 +454,9 @@ impl kohaku_privacy_rpc::AsyncLookupBackend for TorPirClientLookup {
         let mut stealth = None;
         for result in results {
             let (value, broadcast) = result.map_err(kohaku_pir_rpc::PirProviderError::Client)?;
+            if let Some(block) = broadcast.snapshot_block {
+                self.record_snapshot(block);
+            }
             stealth = Some(broadcast);
             values.push(value);
         }

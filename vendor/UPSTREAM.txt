@@ -1,0 +1,16 @@
+Vendored sources. Do not edit these trees in place except to refresh them from upstream.
+
+kohaku-rs
+  repo: https://github.com/ethereum/kohaku-rs.git
+  base: 6dc83a4bcb5bf828d16478358467ed2cabcdb8b9 (experiments/pir-v1)
+  branch: feat/rpc-ring-helios
+  crates: pir-rpc, privacy-rpc, tor-rpc
+  The copy includes the uncommitted ring, window, and Helios changes from that
+  branch on top of the base commit.
+
+inspire-gpu-serving
+  repo: https://github.com/keewoolee/inspire-gpu-serving.git
+  commit: ec3002c6235536072cd998c3f76ec88ca9ffc4df
+  crates: client, keyword, backend-ffi
+  third_party/inspire-gpu is the CPU client checkout backend-ffi compiles.
+  The GPU server is not vendored.

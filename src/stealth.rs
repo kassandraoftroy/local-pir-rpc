@@ -12,6 +12,7 @@ use pir_keyword::manifest;
 pub fn broadcast_from_lists(
     registry: &[manifest::StealthEntry],
     texts: &[manifest::StealthText],
+    snapshot_block: u64,
 ) -> Result<StealthBroadcast, String> {
     let mut out_registry = Vec::with_capacity(registry.len());
     for entry in registry {
@@ -31,6 +32,7 @@ pub fn broadcast_from_lists(
     Ok(StealthBroadcast {
         registry: out_registry,
         texts: out_texts,
+        snapshot_block: (snapshot_block > 0).then_some(snapshot_block),
     })
 }
 
@@ -78,7 +80,8 @@ mod tests {
             }}"#
         );
         let sc = SidecarBroadcast::from_json(&json).unwrap();
-        let got = broadcast_from_lists(&sc.stealth_registry, &sc.stealth_texts).unwrap();
+        let got = broadcast_from_lists(&sc.stealth_registry, &sc.stealth_texts, sc.snapshot_block)
+            .unwrap();
         assert_eq!(got.registry.len(), 1);
         assert_eq!(got.registry[0].scheme_id, 1);
         assert_eq!(got.registry[0].registrant[0], 0x11);
@@ -86,10 +89,15 @@ mod tests {
         assert_eq!(got.texts.len(), 1);
         assert_eq!(got.texts[0].node[0], 0xab);
         assert_eq!(got.texts[0].value, "st:eth:0x03");
+        assert_eq!(got.snapshot_block, Some(7));
 
         let plain_sc = SidecarBroadcast::from_json(r#"{"snapshot_block":7}"#).unwrap();
-        let plain =
-            broadcast_from_lists(&plain_sc.stealth_registry, &plain_sc.stealth_texts).unwrap();
+        let plain = broadcast_from_lists(
+            &plain_sc.stealth_registry,
+            &plain_sc.stealth_texts,
+            plain_sc.snapshot_block,
+        )
+        .unwrap();
         assert!(plain.registry.is_empty());
         assert!(plain.texts.is_empty());
     }

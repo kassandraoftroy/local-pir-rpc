@@ -1,6 +1,7 @@
 //! Clearnet (no Tor) PIR client pool using inspire `pir-client`.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use kohaku_pir_rpc::{LookupBackend, PirProviderError};
@@ -23,6 +24,8 @@ pub struct ClearnetPirLookup {
     available: Condvar,
     pool_size: usize,
     key_mode: KeyMode,
+    /// Highest snapshot block any pooled client has reported. `0` means unknown.
+    snapshot_block: AtomicU64,
 }
 
 impl ClearnetPirLookup {
@@ -76,6 +79,7 @@ impl ClearnetPirLookup {
             available: Condvar::new(),
             pool_size,
             key_mode,
+            snapshot_block: AtomicU64::new(0),
         }))
     }
 
@@ -92,6 +96,10 @@ impl ClearnetPirLookup {
         let mut client = idle.pop_front().expect("non-empty after wait");
         drop(idle);
         let out = f(&mut client);
+        let snap = client.last_snapshot_block;
+        if snap > 0 {
+            self.snapshot_block.fetch_max(snap, Ordering::Relaxed);
+        }
         self.idle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -149,6 +157,7 @@ impl ClearnetPirLookup {
             let stealth = crate::stealth::broadcast_from_lists(
                 &client.stealth_registry,
                 &client.stealth_texts,
+                client.last_snapshot_block,
             )
             .map_err(PirProviderError::Client)?;
             Ok((found.map(|lookup| lookup.value), stealth))
@@ -157,6 +166,13 @@ impl ClearnetPirLookup {
 }
 
 impl LookupBackend for ClearnetPirLookup {
+    fn last_snapshot_block(&self) -> Option<u64> {
+        match self.snapshot_block.load(Ordering::Relaxed) {
+            0 => None,
+            block => Some(block),
+        }
+    }
+
     fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>, PirProviderError> {
         self.lookup_key(key)
     }
