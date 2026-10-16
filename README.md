@@ -1,5 +1,7 @@
 # local-pir-rpc
 
+> NOTE: currently under active dev, DEFINITELY has bugs
+
 Privacy-conscious localhost Ethereum JSON-RPC middleware. Run it on your machine and point a wallet at `http://127.0.0.1:8545` instead of a traditional RPC endpoint.
 
 A traditional endpoint sees your IP together with every address, balance, log, and contract you read - linking them all together. This process sits in between. It uses Tor, PIR, and a ring of public Ethereum RPC endpoints so that no single party gets that whole picture and your reads of ethereum chain are maximally obfuscated from any observer.
