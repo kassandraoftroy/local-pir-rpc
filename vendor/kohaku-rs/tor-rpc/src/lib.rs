@@ -17,6 +17,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use alloy::{
@@ -67,7 +68,14 @@ impl TorRpc {
     /// # Errors
     /// Returns when Arti cannot bootstrap.
     pub async fn connect() -> Result<Self> {
-        let client = TorClient::create_bootstrapped(TorClientConfig::default())
+        // Arti's default stream connect timeout is 10s. A fresh circuit plus a
+        // slow exit trips that and the RPC looks like every provider failed.
+        let mut cfg = TorClientConfig::builder();
+        cfg.stream_timeouts()
+            .connect_timeout(Duration::from_secs(45))
+            .resolve_timeout(Duration::from_secs(20));
+        let cfg = cfg.build().context("tor config")?;
+        let client = TorClient::create_bootstrapped(cfg)
             .await
             .context("bootstrap Tor")?;
         // `ClientConfig::builder` panics unless a process-wide provider is installed.

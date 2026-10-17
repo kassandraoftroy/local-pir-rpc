@@ -25,6 +25,8 @@ pub struct PrivacyBuilder {
     oldest_block: Option<u64>,
     head_block: Option<u64>,
     verified: Option<Arc<VerifiedRpc>>,
+    /// Execution-ring proxy kept alive when Helios is not started.
+    ring_proxy: Option<Arc<crate::proxy::LocalProxy>>,
     tor: Option<Arc<dyn TorRpcBackend>>,
     accounts_lookup: Option<Arc<dyn AsyncLookupBackend>>,
     tokens_lookup: Option<Arc<dyn AsyncLookupBackend>>,
@@ -47,6 +49,7 @@ impl Default for PrivacyBuilder {
             oldest_block: None,
             head_block: None,
             verified: None,
+            ring_proxy: None,
             tor: None,
             accounts_lookup: None,
             tokens_lookup: None,
@@ -140,6 +143,23 @@ impl PrivacyBuilder {
     ) -> Result<Self, PrivacyError> {
         let verified = VerifiedRpc::start(outbound, &self.extra_rpc_urls, data_dir).await?;
         self.verified(Arc::new(verified))
+    }
+
+    /// Point fallback at the public execution ring with no light client.
+    ///
+    /// The same rotating proxy Helios would dial answers JSON-RPC directly.
+    /// Reads are not verified, and the history window stays open.
+    ///
+    /// # Errors
+    ///
+    /// Returns when an extra URL does not parse or the proxy cannot bind.
+    pub async fn open_unverified(mut self, outbound: RpcOutbound) -> Result<Self, PrivacyError> {
+        let ring = crate::ring::RpcRing::mainnet(&self.extra_rpc_urls)?;
+        let proxy = crate::proxy::spawn_proxy(ring.execution, outbound, true).await?;
+        let url = proxy.url().to_string();
+        self = self.fallback_url(&url)?.local_fallback();
+        self.ring_proxy = Some(Arc::new(proxy));
+        Ok(self)
     }
 
     /// Use a live [`TorRpc`] for all egress.
@@ -273,6 +293,9 @@ impl PrivacyBuilder {
         }
         if let Some(verified) = self.verified {
             transport = transport.hold_verified(verified);
+        }
+        if let Some(proxy) = self.ring_proxy {
+            transport = transport.hold_ring(proxy);
         }
         Ok(transport)
     }

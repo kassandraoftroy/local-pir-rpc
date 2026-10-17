@@ -19,7 +19,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(
     name = "local-pir-rpc",
-    about = "localhost Ethereum JSON-RPC verified by a Helios light client"
+    about = "privacy-conscious localhost Ethereum JSON-RPC middleware"
 )]
 struct Args {
     /// Bind address for the Ethereum JSON-RPC HTTP server.
@@ -43,6 +43,11 @@ struct Args {
     /// Dial the public RPC ring in clearnet. Default: the ring is reached through Tor.
     #[arg(long, default_value_t = false)]
     without_tor: bool,
+
+    /// Skip Helios. Public reads still use the ring, and they are not verified.
+    /// The history window stays open.
+    #[arg(long, default_value_t = false)]
+    without_light_client: bool,
 }
 
 #[tokio::main]
@@ -92,6 +97,7 @@ async fn main() {
         oldest_block = oldest,
         pir = pir_urls.is_some(),
         without_tor = args.without_tor,
+        without_light_client = args.without_light_client,
         pir_pool_size = args.pir_pool_size,
         "local-pir-rpc listening"
     );
@@ -106,7 +112,11 @@ async fn main() {
 }
 
 async fn build(args: &Args, urls: Option<&ports::PirUrls>) -> Arc<Backend> {
-    info!("starting Helios light client (about twelve days of history)");
+    if args.without_light_client {
+        info!("light client off; public reads use the ring unverified");
+    } else {
+        info!("starting Helios light client (about twelve days of history)");
+    }
     let mut builder = PrivacyBuilder::new().extra_rpc_urls(args.extra_rpc_urls.clone());
     let outbound = if args.without_tor {
         builder = builder.without_tor();
@@ -132,7 +142,12 @@ async fn build(args: &Args, urls: Option<&ports::PirUrls>) -> Arc<Backend> {
         RpcOutbound::tor(tor)
     };
 
-    match builder.open_verified(outbound, default_data_dir()).await {
+    let opened = if args.without_light_client {
+        builder.open_unverified(outbound).await
+    } else {
+        builder.open_verified(outbound, default_data_dir()).await
+    };
+    match opened {
         Ok(builder) => match builder.build_transport() {
             Ok(transport) => Arc::new(Backend::new(transport)),
             Err(e) => {
@@ -141,7 +156,7 @@ async fn build(args: &Args, urls: Option<&ports::PirUrls>) -> Arc<Backend> {
             }
         },
         Err(e) => {
-            error!(error = %e, "Helios failed to start");
+            error!(error = %e, "public ring failed to start");
             std::process::exit(1);
         }
     }

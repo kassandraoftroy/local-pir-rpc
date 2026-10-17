@@ -92,19 +92,24 @@ pub async fn handle_rpc(
         }
     };
 
-    log_traces(&traces, &call_hints(&body), start.elapsed());
+    log_traces(
+        &traces,
+        &call_hints(&body),
+        start.elapsed(),
+        backend.transport().verified().is_some(),
+    );
 
     (StatusCode::OK, Json(packet_to_json(resp))).into_response()
 }
 
-fn log_traces(traces: &[CallTrace], hints: &[String], elapsed: Duration) {
+fn log_traces(traces: &[CallTrace], hints: &[String], elapsed: Duration, verified: bool) {
     let hint = |i: usize| hints.get(i).map(String::as_str).unwrap_or("");
     if traces.len() <= 1 {
         for (i, trace) in traces.iter().enumerate() {
             info!(
                 "{}  {}  {}{}",
                 trace.method,
-                path_word(trace.path),
+                path_word(trace.path, verified),
                 format_elapsed(elapsed),
                 hint(i)
             );
@@ -113,7 +118,12 @@ fn log_traces(traces: &[CallTrace], hints: &[String], elapsed: Duration) {
     }
     info!("batch {}  {}", traces.len(), format_elapsed(elapsed));
     for (i, trace) in traces.iter().enumerate() {
-        info!("  {}  {}{}", trace.method, path_word(trace.path), hint(i));
+        info!(
+            "  {}  {}{}",
+            trace.method,
+            path_word(trace.path, verified),
+            hint(i)
+        );
     }
 }
 
@@ -215,10 +225,11 @@ fn decode_hex(data: &str) -> Vec<u8> {
     hex::decode(hex_str).unwrap_or_default()
 }
 
-fn path_word(path: CallPath) -> &'static str {
+fn path_word(path: CallPath, verified: bool) -> &'static str {
     match path {
         CallPath::Pir => "pir",
-        CallPath::Fallback => "helios",
+        CallPath::Fallback if verified => "helios",
+        CallPath::Fallback => "ring",
         CallPath::Local => "local",
     }
 }
