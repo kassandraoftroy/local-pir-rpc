@@ -615,7 +615,12 @@ async fn post_local(url: &Url, packet: RequestPacket) -> Result<ResponsePacket, 
         .text()
         .await
         .map_err(TransportErrorKind::custom)?;
-    serde_json::from_str(&text).map_err(TransportErrorKind::custom)
+    serde_json::from_str(&text).map_err(|err| {
+        let preview: String = text.chars().take(120).collect();
+        TransportErrorKind::custom(std::io::Error::other(format!(
+            "{err}; response started with {preview:?}"
+        )))
+    })
 }
 
 fn success_response(id: Id, value: &Value) -> Result<Response, TransportError> {

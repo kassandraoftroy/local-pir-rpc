@@ -1,6 +1,6 @@
 # local-pir-rpc
 
-> NOTE: currently under active dev, DEFINITELY has bugs
+> NOTE: currently under active dev, NOT stable
 
 Privacy-conscious localhost Ethereum JSON-RPC middleware. Run it on your machine and point a wallet at `http://127.0.0.1:8545` instead of a traditional RPC endpoint.
 

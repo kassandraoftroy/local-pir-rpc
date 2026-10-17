@@ -137,26 +137,30 @@ async fn forward(State(state): State<ProxyState>, req: axum::extract::Request) -
         .map(http_body_util::Collected::to_bytes)
         .unwrap_or_default();
     let isolated = state.execution && wants_isolated(&body);
+    // One address-bearing request keeps a single Tor circuit for every provider
+    // it tries. A fresh circuit per retry is what made balances fail over Tor.
+    let outbound = match (&state.outbound, isolated) {
+        (RpcOutbound::Tor(tor), true) => RpcOutbound::tor(tor.isolated()),
+        (outbound, _) => outbound.clone(),
+    };
     let attempts = crate::ring::distinct_attempts(state.urls.as_slice(), state.urls.len());
     let mut last = "no providers configured".to_string();
     for url in attempts {
         let target = target_url(&url, &path, state.execution);
         match tokio::time::timeout(
             ATTEMPT_TIMEOUT,
-            state.outbound.exchange(
-                &state.http,
-                &target,
-                method.as_str(),
-                &headers,
-                &body,
-                isolated,
-            ),
+            outbound.exchange(&state.http, &target, method.as_str(), &headers, &body, false),
         )
         .await
         {
             Ok(Ok((status, bytes))) if provider_rejected(status, &bytes) => {
                 last = format!("{target} HTTP {status}");
-                warn!(%target, %status, "public rpc failed; trying another provider");
+                warn!(
+                    %target,
+                    %status,
+                    body = %body_preview(&bytes),
+                    "public rpc failed; trying another provider"
+                );
             }
             Ok(Ok((status, bytes))) => {
                 return Response::builder()
@@ -215,23 +219,46 @@ fn forward_header(name: &str) -> bool {
     )
 }
 
-/// A gateway rejected the call, or the body is not JSON. Real execution
-/// errors (`execution reverted`, bad params) are returned to the wallet.
-fn provider_rejected(status: StatusCode, body: &[u8]) -> bool {
-    if matches!(status.as_u16(), 401 | 403 | 408 | 429 | 500 | 502 | 503 | 504) {
-        return true;
+fn body_preview(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let mut preview: String = text.chars().take(120).collect();
+    if text.chars().count() > 120 {
+        preview.push('…');
     }
-    if !(status.is_success() || status.as_u16() == 400) {
-        return false;
+    preview
+}
+
+/// A gateway rejected the call, or the body is not a JSON-RPC payload.
+/// Real execution errors (`execution reverted`, bad params) are returned.
+fn provider_rejected(status: StatusCode, body: &[u8]) -> bool {
+    // 520–530 are Cloudflare HTML pages. Forwarding those is what produced
+    // `expected value at line 1 column 1` in the wallet.
+    if !status.is_success() && status.as_u16() != 400 {
+        return true;
     }
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return true;
     };
+    if !is_jsonrpc_payload(&value) {
+        return true;
+    }
     let items = match &value {
         Value::Array(items) => items.as_slice(),
         other => std::slice::from_ref(other),
     };
     !items.is_empty() && items.iter().all(is_provider_rejection)
+}
+
+fn is_jsonrpc_payload(value: &Value) -> bool {
+    let items = match value {
+        Value::Array(items) => items.as_slice(),
+        other => std::slice::from_ref(other),
+    };
+    !items.is_empty()
+        && items.iter().all(|item| {
+            item.as_object()
+                .is_some_and(|obj| obj.contains_key("result") || obj.contains_key("error"))
+        })
 }
 
 fn is_provider_rejection(item: &Value) -> bool {
@@ -380,6 +407,18 @@ mod tests {
         let base = Url::parse("https://ethereum.blockpi.network/v1/rpc/public").unwrap();
         let got = target_url(&base, "/eth/v1/beacon/headers/head", true);
         assert_eq!(got.as_str(), base.as_str());
+    }
+
+    #[test]
+    fn html_error_page_is_retried() {
+        let status = StatusCode::from_u16(522).unwrap();
+        assert!(provider_rejected(status, b"<html><body>error code: 522</body></html>"));
+    }
+
+    #[test]
+    fn chain_id_result_is_kept() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#;
+        assert!(!provider_rejected(StatusCode::OK, body));
     }
 
     #[test]
